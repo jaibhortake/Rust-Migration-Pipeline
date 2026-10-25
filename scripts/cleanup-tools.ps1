@@ -9,7 +9,6 @@ Get-ChildItem $root -Recurse -Directory -Filter __pycache__ -ErrorAction Silentl
 $cargo = Join-Path $env:USERPROFILE ".cargo"
 $rustup = Join-Path $env:USERPROFILE ".rustup"
 foreach ($p in $cargo, $rustup) { if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Host "removed $p" } }
-# uv and npm caches created by this project
-foreach ($p in "$env:LOCALAPPDATA\uv") { if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Host "removed $p" } }
-npm cache clean --force 2>$null
+# The uv cache for this project lives in .tools\uv-cache (removed above); the global uv and npm caches
+# are shared with other projects, so they are left alone.
 Write-Host "Cleanup done."
