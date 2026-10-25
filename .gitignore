@@ -1,0 +1,12 @@
+.env
+.tools/
+.venv/
+__pycache__/
+node_modules/
+dist/
+target/
+workspace/
+backend/data/
+backend/benchmark.log
+frontend/.npmrc
+*.log
