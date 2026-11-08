@@ -1,81 +1,130 @@
-"""Benchmark the pipeline over samples/python and samples/cpp.
+"""Benchmark: full pipeline vs a one-shot LLM baseline on every sample (single files and multi-file projects).
 
-Run from E:\\kaggle\\migration with PYTHONPATH=backend:
-    python backend/scripts/benchmark.py [--only SUBSTR] [--language python|cpp]
-NOTE: this calls LLM providers (paid/limited).
+Both are scored on the SAME inputs, recorded from the original program by the pipeline's test generation.
+The baseline is what "just ask an LLM" gives you: one call, whole source in, main.rs out, no analysis, no repair.
+
+    cd backend && .venv/Scripts/python -m scripts.benchmark [--only NAME] [--limit N]
+Calls the LLM (cached in SQLite, so re-runs are cheap).
 """
+
 import argparse
 import asyncio
 import json
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
-from app.pipeline.runner import run_job
+from app.analysis.project import build_project
+from app.config import ROOT, settings
+from app.llm.client import chat
+from app.pipeline import prompts
+from app.pipeline.runner import WORKSPACE, cargo_toml, compare, extract_block, run_migration
+from app.sandbox import make_sandbox
 
-ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / "samples"
 OUT = ROOT / "backend" / "benchmark_results.json"
-EXTS = {"python": ".py", "cpp": ".cpp"}
 
 
-async def emit(stage: str, status: str, data: dict) -> None:
-    pass
-
-
-def collect(language: str | None, only: str | None) -> list[tuple[str, Path]]:
+def collect() -> list[tuple[str, str, dict[str, str]]]:
     items = []
-    for lang, ext in EXTS.items():
-        if language and lang != language:
-            continue
+    for lang, ext in (("python", ".py"), ("cpp", ".cpp")):
         for p in sorted((SAMPLES / lang).glob(f"*{ext}")):
-            if only and only not in p.name:
-                continue
-            items.append((lang, p))
+            items.append((f"{p.stem} ({lang})", "file", {p.name: p.read_text(encoding="utf-8")}))
+    for d in sorted((SAMPLES / "projects").iterdir()):
+        files = {str(f.relative_to(d)).replace("\\", "/"): f.read_text(encoding="utf-8") for f in sorted(d.rglob("*")) if f.is_file()}
+        items.append((d.name, "project", files))
     return items
+
+
+async def baseline(files: dict[str, str], language: str, tests: list[dict]) -> dict:
+    src = "\n\n".join(f"// ===== {p}\n{t}" for p, t in files.items())
+    text = await chat(
+        [{"role": "system", "content": prompts.BASELINE_SYSTEM}, {"role": "user", "content": f"Language: {language}\n\n{src}"}]
+    )
+    WORKSPACE.mkdir(exist_ok=True)
+    d = Path(tempfile.mkdtemp(dir=WORKSPACE))
+    sb = make_sandbox(d)
+    out = {"status": "compile_failed", "tests_passed": 0, "tests_total": len(tests)}
+    try:
+        (d / "rust" / "src").mkdir(parents=True)
+        (d / "rust" / "Cargo.toml").write_text(cargo_toml([]))
+        (d / "rust" / "src" / "main.rs").write_text(extract_block(text))
+        await sb.start()
+        cmd = ["cargo", "build", "--release", "--quiet"] + (["--offline"] if sb.name == "docker" else [])
+        if not (await sb.run(cmd, "rust", timeout=settings.build_timeout_s)).ok:
+            return out
+        passed = 0
+        for t in tests:
+            r = await sb.run([sb.rust_exe()], "rust", t["stdin"])
+            passed += r.ok and compare(t["expected"], r.stdout) != "diff"
+        out.update(tests_passed=passed, status="equivalent" if passed == len(tests) else "partial")
+        return out
+    finally:
+        await sb.stop()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def quiet(*_a) -> None:
+    pass
 
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", help="only files whose name contains this substring")
-    ap.add_argument("--language", choices=list(EXTS), help="limit to one language")
+    ap.add_argument("--only", help="substring of the sample name")
+    ap.add_argument("--limit", type=int)
     args = ap.parse_args()
-
-    items = collect(args.language, args.only)
-    if not items:
-        print("no matching sample files")
-        return
-
+    items = [i for i in collect() if not args.only or args.only in i[0]][: args.limit]
     rows = []
-    header = f"{'file':<32}{'status':<12}{'tests':<8}{'attempts':<10}{'providers':<24}{'seconds':>8}"
-    print(header)
-    print("-" * len(header))
-    for lang, path in items:
-        name = f"{lang}/{path.name}"
+    for name, kind, files in items:
+        project = build_project(files)
         t0 = time.time()
-        try:
-            res = await run_job(lang, path.read_text(encoding="utf-8"), emit)
-            row = {
-                "file": name, "status": res.status, "tests_passed": res.tests_passed,
-                "tests_total": res.tests_total, "attempts": res.attempts,
-                "providers": sorted(res.providers), "seconds": res.seconds,
-                "unsafe_count": res.unsafe_count, "message": res.message,
-            }
-        except Exception as e:  # keep going on a per-file crash
-            row = {
-                "file": name, "status": "error", "tests_passed": 0, "tests_total": 0,
-                "attempts": 0, "providers": [], "seconds": round(time.time() - t0, 2),
-                "unsafe_count": 0, "message": f"{type(e).__name__}: {e}",
-            }
+        res = await run_migration(project, {}, quiet)
+        ev = res.get("evidence", {})
+        row = {
+            "name": name,
+            "language": project.language,
+            "kind": kind,
+            "loc": project.loc,
+            "pipeline": {
+                "status": res["status"],
+                "tests_passed": ev.get("tests_passed", 0),
+                "tests_total": ev.get("tests_total", 0),
+                "line_coverage": ev.get("line_coverage"),
+                "branch_coverage": ev.get("branch_coverage"),
+                "quality": (res.get("quality") or {}).get("score"),
+                "seconds": round(time.time() - t0, 1),
+                "llm_calls": res.get("usage", {}).get("calls", 0) + res.get("usage", {}).get("cached", 0),
+                "repairs": res.get("attempts", {}),
+            },
+            "baseline": {"status": "skipped", "tests_passed": 0, "tests_total": 0},
+        }
+        if res.get("tests"):
+            try:
+                row["baseline"] = await baseline(res["original_files"], project.language, res["tests"])
+            except Exception as e:  # baseline failures must not stop the benchmark
+                row["baseline"] = {"status": "failed", "tests_passed": 0, "tests_total": len(res["tests"]), "error": str(e)[:200]}
         rows.append(row)
-        print(f"{name:<32}{row['status']:<12}{row['tests_passed']}/{row['tests_total']:<6}"
-              f"{row['attempts']:<10}{','.join(row['providers']):<24}{row['seconds']:>8}", flush=True)
+        p, b = row["pipeline"], row["baseline"]
+        print(
+            f"{name:<34} pipeline {p['status']:<14} {p['tests_passed']}/{p['tests_total']} cov {p['line_coverage']}  "
+            f"baseline {b['status']:<14} {b['tests_passed']}/{b['tests_total']}  {p['seconds']}s",
+            flush=True,
+        )
 
-    verified = sum(1 for r in rows if r["status"] == "verified")
-    pct = 100.0 * verified / len(rows)
-    print(f"\nverified {verified}/{len(rows)} ({pct:.1f}%)")
-    OUT.write_text(json.dumps({"verified": verified, "total": len(rows), "percent_verified": pct,
-                               "results": rows}, indent=2), encoding="utf-8")
-    print(f"results written to {OUT}")
+    covs = [r["pipeline"]["line_coverage"] for r in rows if r["pipeline"]["line_coverage"] is not None]
+    quals = [r["pipeline"]["quality"] for r in rows if r["pipeline"]["quality"] is not None]
+    totals = {
+        "pipeline_equivalent": sum(r["pipeline"]["status"] == "equivalent" for r in rows),
+        "baseline_equivalent": sum(r["baseline"]["status"] == "equivalent" for r in rows),
+        "mean_line_coverage": round(sum(covs) / len(covs), 3) if covs else None,
+        "mean_quality": round(sum(quals) / len(quals), 1) if quals else None,
+    }
+    OUT.write_text(
+        json.dumps({"generated": time.strftime("%Y-%m-%d %H:%M"), "model": settings.groq_model, "rows": rows, "totals": totals}, indent=1)
+    )
+    print(json.dumps(totals))
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

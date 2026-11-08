@@ -1,28 +1,109 @@
-# Rust Migration Pipeline
+# Rust Migrator
 
-Translates C++ and Python programs to Rust through a web UI. A translation is marked **verified** only if the
-Rust compiles and produces the same output as the original program on generated test inputs.
+An **analysis-first** pipeline that migrates C++ and Python codebases (single files or multi-file projects) to Rust,
+and backs every result with **measured evidence** instead of "the LLM said so".
 
-Pipeline: parse → (wrap function-only input in a driver) → generate tests and record reference output from the
-real original → translate with an LLM → `cargo build` / fix loop → compare outputs → report.
+Any LLM can turn a file of C++ into something that looks like Rust. Real migrations fail on other problems:
+- inconsistent decisions across files;
+- semantic traps such as Python's `//` floor division, dict insertion order, unbounded ints, or inheritance hierarchies;
+- not knowing whether the result *behaves* the same.
 
-LLM: Groq (`openai/gpt-oss-120b`) with Ollama (`llama3.2`) as fallback.
+This project is built around those problems.
 
-See [PLAN.md](PLAN.md) for the design.
+## What it does
 
-## Setup (Windows)
+| Stage | What happens | LLM? |
+|---|---|---|
+| **1. Assessment** | tree-sitter symbol tables, file/module dependency graph (SCCs, leaves-first order), cyclomatic complexity, risk detector for ~35 semantic hazards with a Rust strategy for each, per-module difficulty, effort estimate, readiness verdict | no (instant, free) |
+| **2. Mapping contract** | **Class map** (struct / trait / implementor / enum / composition / error enum, with the reason and the trait impls each dunder/operator needs), **library map** (header/module → std, allowed crate, manual, unsupported), **type map**. All editable in the UI; the same contract is given to every module so all files make the same decisions. | no |
+| **3. Coverage-guided test generation** | Inputs come from LLM seeds, then **mutation fuzzing**, then **LLM prompts that target the exact lines not yet executed**. Each input runs on the *real original*, instrumented with gcov or coverage.py. Inputs whose output is not deterministic are dropped. | yes |
+| **4. Module-by-module translation** | Leaves first. Each module gets the contract plus the public API of modules already migrated. Each dependency group must pass `cargo check` (with compiler-guided repair) before the next group starts. | yes |
+| **5. Differential verification** | The whole crate is built and run on every recorded input. Failing inputs are **shrunk with delta debugging** before the repair prompt. | yes (repairs) |
+| **6. Quality** | clippy and rustfmt. A clippy clean-up is kept **only if every test still passes**. Scores count `unsafe`, unwrap/clone density and Rc/RefCell use. | yes (once) |
+| **7. Report** | Status, confidence, line and branch coverage, minimised failures, side-by-side diff. The download includes `MIGRATION_REPORT.md` and the recorded tests as a **`cargo test` regression suite**. | no |
 
-1. `copy .env.example .env` and fill in `GROQ_API_KEY`, `ADMIN_PASSWORD`, `SESSION_SECRET`.
-2. `powershell -File scripts/setup-tools.ps1` installs uv, Rust (GNU) and MinGW g++ into `.tools/`.
-3. Backend: `uv sync --project backend`, then from `backend/`:
-   `.venv\Scripts\python -m uvicorn app.main:app --port 8280`
-4. Frontend: `cd frontend && npm install && npm run dev` (http://localhost:5280, proxies `/api` to port 8280).
-5. Benchmark: `PYTHONPATH=backend backend\.venv\Scripts\python backend\scripts\benchmark.py`
+### What "equivalent" means (and does not mean)
+The status is **"behaviourally equivalent on N tests"**: the Rust program printed exactly what the original printed
+for every recorded input. This is **test-based behavioural verification, not a proof of equivalence**. Behaviour on
+untested inputs, and on lines the tests never executed, is unverified. That is why every report shows the original's
+line and branch coverage and lists the never-executed lines for manual review. Confidence:
+- *high*: all tests pass and ≥ 90% line coverage with ≥ 8 inputs
+- *medium*: ≥ 70% line coverage
+- *low*: less coverage than that
 
-`scripts/cleanup-tools.ps1` removes every downloaded tool and build artifact.
+Floats are compared with a 1e-9 relative tolerance, and every such match is counted separately.
 
-## Status
+### Security: the sandbox
+Uploaded code and generated Rust are compiled and run **only inside Docker containers** built from `sandbox/Dockerfile`:
+- `--network none`
+- memory, CPU and pids limits
+- `--cap-drop ALL`, `no-new-privileges`
+- non-root user, tmpfs scratch space
+- a per-command `timeout` plus a host-side kill
+- one container per job, removed afterwards; leftovers are removed when the server starts
 
-Working: Python and C++ single-file translation, live progress UI, file upload, job history (SQLite),
-Cargo project download, benchmark view.
-Not built yet: multi-file/zip codebase mode, Dockerfile, automated tests.
+Crates allowed in generated code (`num-bigint`, `regex`, `serde_json`, `itertools`, …) are fetched when the image is built, and jobs build with `--offline`.
+`SANDBOX=local` exists for development without Docker and gives **no isolation**.
+
+Other hardening:
+- signed session cookies that expire (`httponly`, `samesite=strict`, optional `secure`)
+- rate-limited login with constant-time password comparison
+- the server refuses to start with an empty password or a weak secret
+- upload size and file-count limits
+- zip-slip and zip-bomb checks
+- an allowlist for crates
+- no shell interpolation anywhere
+
+## Quick start (Windows)
+
+Requires [uv](https://docs.astral.sh/uv/), Node.js 20+, and Docker Desktop (running).
+
+```powershell
+powershell -File scripts\setup.ps1   # .env, Python deps, frontend build, sandbox image (~1.5 GB)
+# edit .env: GROQ_API_KEY, ADMIN_PASSWORD, SESSION_SECRET (16+ random chars)
+powershell -File scripts\start.ps1   # http://127.0.0.1:8280
+```
+
+Development with hot reload: run `uvicorn app.main:app --port 8280` in `backend/`, then `npm run dev` in `frontend/`
+(http://localhost:5280, which proxies `/api` to the backend).
+
+If your antivirus or proxy re-signs TLS (for example Norton Web Shield), export its root CA to `sandbox/certs/extra-ca.crt`
+before building the image.
+
+`scripts\cleanup-tools.ps1` removes the virtualenv, node_modules, builds, job data, the sandbox image and the Docker build cache.
+
+## Tests and benchmark
+
+```powershell
+cd backend
+uv run pytest -q                 # unit + API tests; Docker integration tests run when the sandbox image exists
+uv run ruff check app tests scripts
+uv run python -m scripts.benchmark   # full pipeline vs one-shot LLM baseline on samples/ (calls the LLM)
+```
+
+The integration tests drive the real sandbox with a scripted fake LLM: a deliberately wrong translation must be
+caught, minimised and repaired. CI (`.github/workflows/ci.yml`) runs lint, all tests and the frontend build.
+
+The benchmark covers 20 single-file programs and 3 multi-file projects. It scores the pipeline and a one-shot
+"just ask the LLM" baseline on **the same recorded inputs**, and reports pass rate, coverage, quality score and LLM calls.
+Results appear on the Benchmark page.
+
+## Layout
+
+```
+backend/app/
+  analysis/   project loading, tree-sitter symbols, dependency graph, risk rules, assessment
+  mapping/    class, library and type mapping (the migration contract)
+  verify/     coverage parsers (gcov / coverage.py), mutation + delta debugging, clippy/quality scoring
+  pipeline/   orchestration (runner.py), prompts, markdown report
+  sandbox.py  Docker / local execution     security.py  sessions, rate limit     db.py  SQLite
+frontend/src/ pages: New → Assessment → Mappings → Migrate (live) → Report; Benchmark
+sandbox/      Dockerfile for the execution sandbox (+ prefetched crates)
+samples/      single-file programs and multi-file projects
+```
+
+## Limits
+- Programs must be deterministic stdin/stdout programs to be verified. File, network and GUI I/O and randomness are flagged as unsupported.
+- One language per project. The Rust output is one crate: one module per Python file, or per C++ header/source pair.
+- Templates, macros, and pointer-heavy data structures get a strategy, but expect review.
+- The effort estimate is a heuristic (about 30 LOC per hour, scaled by risk), not a measured figure.

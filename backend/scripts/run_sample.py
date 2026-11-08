@@ -1,23 +1,37 @@
-"""Run one sample file through the pipeline from the command line: run_sample.py <python|cpp> <file>"""
+"""Run the full pipeline on one sample file or project directory and print the event stream and summary.
+
+cd backend && .venv/Scripts/python -m scripts.run_sample ../samples/projects/py_bank
+"""
+
 import asyncio
+import json
 import sys
 from pathlib import Path
 
-from app.pipeline.runner import run_job
+from app.analysis.project import build_project
+from app.pipeline.runner import run_migration
 
 
 async def emit(stage: str, status: str, data: dict) -> None:
-    print(f"[{stage}] {status} {data if data else ''}", flush=True)
+    extra = {k: v for k, v in data.items() if k != "errors"}
+    print(f"[{stage:>14}] {status:<8} {json.dumps(extra)[:160]}")
+    if data.get("errors"):
+        print("    " + str(data["errors"])[-600:].replace("\n", "\n    "))
 
 
-async def main() -> None:
-    language, path = sys.argv[1], Path(sys.argv[2])
-    res = await run_job(language, path.read_text(encoding="utf-8"), emit)
-    print(f"\nstatus={res.status} tests={res.tests_passed}/{res.tests_total} attempts={res.attempts} "
-          f"providers={sorted(res.providers)} time={res.seconds}s unsafe={res.unsafe_count}")
-    if res.message:
-        print("message:", res.message)
-    print("\n--- Rust ---\n" + res.rust)
+async def main(target: str) -> None:
+    p = Path(target)
+    files = (
+        {str(f.relative_to(p)).replace("\\", "/"): f.read_text(encoding="utf-8") for f in p.rglob("*") if f.is_file()}
+        if p.is_dir()
+        else {p.name: p.read_text(encoding="utf-8")}
+    )
+    res = await run_migration(build_project(files), {}, emit)
+    print(json.dumps({k: res.get(k) for k in ("status", "confidence", "message", "evidence", "attempts", "usage", "seconds")}, indent=1))
+    print("quality:", json.dumps({k: v for k, v in (res.get("quality") or {}).items() if k != "warnings"}))
+    for path, code in res.get("files", {}).items():
+        print(f"----- {path}\n{code[:1500]}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1]))

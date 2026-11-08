@@ -1,14 +1,16 @@
-# Removes every downloaded tool and build artifact. Run after the code is pushed to git.
+# Removes everything installed or built for this project: virtualenv, node_modules, builds, job data,
+# the sandbox Docker image and its build cache. Source code and .env are kept.
 $root = Split-Path -Parent $PSScriptRoot
-foreach ($p in ".tools", "backend\.venv", "frontend\node_modules", "frontend\dist", "workspace") {
+foreach ($p in ".tools", "backend\.venv", "backend\data", "frontend\node_modules", "frontend\dist", "workspace",
+               "backend\.pytest_cache", "backend\.ruff_cache", "sandbox\certs\extra-ca.crt") {
     $full = Join-Path $root $p
     if (Test-Path $full) { Remove-Item -Recurse -Force $full; Write-Host "removed $p" }
 }
 Get-ChildItem $root -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-# Pre-existing rustup install (user asked for it to be removed too)
-$cargo = Join-Path $env:USERPROFILE ".cargo"
-$rustup = Join-Path $env:USERPROFILE ".rustup"
-foreach ($p in $cargo, $rustup) { if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Host "removed $p" } }
-# The uv cache for this project lives in .tools\uv-cache (removed above); the global uv and npm caches
-# are shared with other projects, so they are left alone.
+if (Get-Command docker -ErrorAction SilentlyContinue) {
+    docker ps -aq --filter "label=rust-migrator=1" | ForEach-Object { docker rm -f $_ | Out-Null }
+    docker image rm -f rust-migrator-sandbox:1 2>$null | Out-Null
+    docker builder prune -af 2>$null | Out-Null
+    Write-Host "removed sandbox image and build cache"
+}
 Write-Host "Cleanup done."

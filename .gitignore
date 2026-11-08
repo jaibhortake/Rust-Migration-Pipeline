@@ -10,3 +10,8 @@ backend/data/
 backend/benchmark.log
 frontend/.npmrc
 *.log
+sandbox/certs/*.crt
+backend/benchmark_results.json.bak
+.coverage
+.ruff_cache/
+.pytest_cache/

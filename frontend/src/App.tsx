@@ -1,203 +1,111 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import Editor, { DiffEditor } from '@monaco-editor/react'
-import { api, openWs, Unauthorized, type JobResult, type JobSummary, type Lang, type PipelineEvent } from './api'
-import Login from './Login'
-import Timeline from './Timeline'
-import BenchmarkPanel from './BenchmarkPanel'
-import { EXAMPLES } from './examples'
-
-const badge: Record<string, string> = {
-  verified: 'bg-green-600', compiles_only: 'bg-amber-500', failed: 'bg-red-600', running: 'bg-blue-500',
-}
+import { useCallback, useEffect, useState } from 'react'
+import { api, Unauthorized, type Health, type ProjectSummary } from './api'
+import { Alert, Button, cx, Icon, statusMeta } from './components/ui'
+import { ago, useRoute, useTheme } from './hooks'
+import Benchmark from './pages/Benchmark'
+import Login from './pages/Login'
+import NewProject from './pages/NewProject'
+import ProjectView from './pages/ProjectView'
 
 export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null)
+  useTheme()
   useEffect(() => { api.me().then(() => setAuthed(true)).catch(() => setAuthed(false)) }, [])
-  if (authed === null) return null
+  if (authed === null) return <div className="grid h-full place-items-center"><div className="skeleton h-10 w-40" /></div>
   if (!authed) return <Login onDone={() => setAuthed(true)} />
-  return <Main onLogout={() => setAuthed(false)} />
+  return <Shell onLogout={() => setAuthed(false)} />
 }
 
-const store = {
-  get(key: string): string | null { try { return localStorage.getItem(key) } catch { return null } },
-  set(key: string, value: string) { try { localStorage.setItem(key, value) } catch { /* storage unavailable */ } },
-}
-
-const statusLabel: Record<string, string> = {
-  verified: 'Verified', compiles_only: 'Compiles, output differs', failed: 'Failed', running: 'Running',
-}
-
-function Main({ onLogout }: { onLogout: () => void }) {
-  const [lang, setLang] = useState<Lang>(store.get('lang') === 'cpp' ? 'cpp' : 'python')
-  const [code, setCode] = useState(store.get('draft') ?? EXAMPLES[0].code)
-  const [labels, setLabels] = useState<Record<string, string>>(() => { try { return JSON.parse(store.get('labels') ?? '{}') } catch { return {} } })
-  const [elapsed, setElapsed] = useState(0)
-  const [view, setView] = useState<'translate' | 'benchmark'>('translate')
-  const translateRef = useRef<() => void>(() => {})
-  useEffect(() => { store.set('draft', code) }, [code])
-  useEffect(() => { store.set('lang', lang) }, [lang])
-  useEffect(() => { store.set('labels', JSON.stringify(labels)) }, [labels])
-  const [events, setEvents] = useState<PipelineEvent[]>([])
-  const [result, setResult] = useState<JobResult | null>(null)
-  const [jobs, setJobs] = useState<JobSummary[]>([])
-  const [curId, setCurId] = useState<string | null>(null)
-  const [running, setRunning] = useState(false)
+function Shell({ onLogout }: { onLogout: () => void }) {
+  const [route, go] = useRoute()
+  const [theme, toggleTheme] = useTheme()
+  const [projects, setProjects] = useState<ProjectSummary[] | null>(null)
+  const [health, setHealth] = useState<Health | null>(null)
   const [error, setError] = useState('')
-  const [copied, setCopied] = useState(false)
-  const [sidebar, setSidebar] = useState(false)
-  const fileRef = useRef<HTMLInputElement>(null)
-  const loadFile = async (f: File) => {
-    if (f.size > 50_000) { setError('File is too large (limit is 50,000 characters).'); return }
-    const name = f.name.toLowerCase()
-    if (/\.py$/.test(name)) setLang('python')
-    else if (/\.(cpp|cc|cxx|hpp|h)$/.test(name)) setLang('cpp')
-    setCode(await f.text())
-    setError('')
-  }
-  const [dark, setDark] = useState(document.documentElement.classList.contains('dark'))
-  const ws = useRef<WebSocket | null>(null)
+  const [nav, setNav] = useState(false)
 
-  const fail = useCallback((e: unknown) => { if (e instanceof Unauthorized) onLogout(); else setError(String(e instanceof Error ? e.message : e)) }, [onLogout])
-  const refresh = useCallback(() => api.list().then(setJobs).catch(fail), [fail])
-  useEffect(() => { refresh(); return () => ws.current?.close() }, [refresh])
+  const onError = useCallback((e: unknown) => {
+    if (e instanceof Unauthorized) onLogout()
+    else setError(e instanceof Error ? e.message : String(e))
+  }, [onLogout])
+  const refresh = useCallback(() => { api.projects().then(setProjects).catch(onError) }, [onError])
+  useEffect(() => { refresh(); api.health().then(setHealth).catch(() => {}) }, [refresh])
+  useEffect(() => { setNav(false); setError('') }, [route.join('/')])
 
-  const finish = useCallback(async (id: string) => {
-    try { const d = await api.get(id); setResult(d.result); setEvents(d.events) } catch (e) { fail(e) }
-    setRunning(false); refresh()
-  }, [fail, refresh])
-
-  const watch = useCallback((id: string) => {
-    ws.current?.close()
-    const w = openWs(id); ws.current = w
-    setEvents([]); setResult(null); setRunning(true)
-    w.onmessage = m => { try { setEvents(ev => [...ev, JSON.parse(m.data)]) } catch { /* ignore */ } }
-    w.onclose = () => { if (ws.current === w) finish(id) }
-  }, [finish])
-
-  const translate = async () => {
-    if (!code.trim() || running) return
-    setError('')
-    try {
-      const { id } = await api.create(lang, code)
-      const first = code.split('\n').find(l => l.trim()) ?? ''
-      setLabels(m => ({ ...m, [id]: first.trim().slice(0, 28) }))
-      setCurId(id); watch(id); refresh()
-    } catch (e) { fail(e) }
-  }
-  translateRef.current = translate
-
-  useEffect(() => {
-    if (!running) return
-    const start = Date.now(); setElapsed(0)
-    const t = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000)
-    return () => clearInterval(t)
-  }, [running])
-
-  const downloadProject = () => { if (curId) window.location.href = `/api/jobs/${curId}/download` }
-
-  const load = async (id: string) => {
-    ws.current?.close(); ws.current = null; setError(''); setSidebar(false)
-    try {
-      const d = await api.get(id)
-      setCurId(id); setLang(d.language); setEvents(d.events); setResult(d.result)
-      if (d.result) { setCode(d.result.original); setRunning(false) } else watch(id)
-    } catch (e) { fail(e) }
-  }
-
-  const monacoTheme = dark ? 'vs-dark' : 'light'
-  const opts = { minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true }
-  const providers = result ? (Array.isArray(result.providers) ? result.providers.join(', ') : result.providers) : ''
-  const btn = 'rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-100 dark:hover:bg-slate-800'
+  const [page, pid, tab] = route
+  const sandboxBad = health && !health.sandbox.ready
 
   return (
-    <div className="h-full flex flex-col">
-      <header className="flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 px-3 py-2">
-        <button className={btn + ' lg:hidden'} onClick={() => setSidebar(s => !s)}>History</button>
-        <h1 className="font-semibold">Rust Migrator</h1>
-        <div className="ml-auto flex gap-2">
-          <button className={btn} onClick={() => setView(v => v === 'benchmark' ? 'translate' : 'benchmark')}>{view === 'benchmark' ? 'Back to translator' : 'Benchmark'}</button>
-          <button className={btn} onClick={() => { document.documentElement.classList.toggle('dark'); setDark(d => !d) }}>{dark ? 'Light' : 'Dark'}</button>
-          <button className={btn} onClick={async () => { await api.logout().catch(() => {}); onLogout() }}>Logout</button>
+    <div className="flex h-full flex-col">
+      <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-3 border-b border-zinc-200 bg-white/80 px-4 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/80">
+        <button className="rounded-md p-1 text-zinc-500 lg:hidden" onClick={() => setNav(n => !n)} aria-label="Toggle projects">{Icon.menu}</button>
+        <a href="#/" className="flex items-center gap-2.5">{Icon.logo}<span className="font-semibold tracking-tight">Rust Migrator</span></a>
+        <nav className="ml-4 hidden gap-1 sm:flex">
+          {[['', 'Projects'], ['benchmark', 'Benchmark']].map(([p, l]) => (
+            <a key={p} href={`#/${p}`} className={cx('rounded-md px-3 py-1.5 text-sm font-medium transition-colors', (page === p || (!page && !p) || (page === 'p' && !p) || (page === 'new' && !p)) ? 'text-zinc-900 dark:text-zinc-100' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100')}>{l}</a>
+          ))}
+        </nav>
+        <div className="ml-auto flex items-center gap-2">
+          {health && <span title={health.sandbox.error || health.sandbox.warning || `sandbox: ${health.sandbox.mode}`}
+            className={cx('hidden items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium md:inline-flex', sandboxBad ? 'bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-300' : 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300')}>
+            <span className={cx('h-1.5 w-1.5 rounded-full', sandboxBad ? 'bg-red-500' : health.sandbox.mode === 'docker' ? 'bg-emerald-500' : 'bg-amber-500')} />
+            {health.sandbox.mode} sandbox · {health.llm}</span>}
+          <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? Icon.sun : Icon.moon}</Button>
+          <Button variant="ghost" size="sm" onClick={async () => { await api.logout().catch(() => {}); onLogout() }}>Sign out</Button>
         </div>
       </header>
-      <div className="flex flex-1 min-h-0 relative">
-        <aside className={`${sidebar ? 'block' : 'hidden'} lg:block absolute lg:static z-10 inset-y-0 left-0 w-64 shrink-0 overflow-auto border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 p-2`}>
-          <div className="text-xs uppercase text-slate-500 px-2 py-1">History</div>
-          {jobs.length === 0 && <div className="px-2 text-sm text-slate-400">No jobs yet</div>}
-          {[...jobs].reverse().map(j => (
-            <button key={j.id} onClick={() => load(j.id)} className={`w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${j.id === curId ? 'bg-slate-100 dark:bg-slate-800' : ''}`}>
-              <span className={`h-2 w-2 rounded-full ${badge[j.status] ?? 'bg-slate-400'}`} />
-              <span className="truncate font-mono text-xs" title={j.id}>{labels[j.id] || j.id.slice(0, 8)}</span>
-              <span className="ml-auto text-xs text-slate-500">{j.language}</span>
-            </button>
-          ))}
+
+      <div className="relative flex min-h-0 flex-1">
+        <aside className={cx('absolute inset-y-0 left-0 z-20 w-72 shrink-0 flex-col border-r border-zinc-200 bg-white transition-transform duration-200 lg:static lg:flex lg:translate-x-0 dark:border-zinc-800 dark:bg-zinc-950',
+          nav ? 'flex translate-x-0 shadow-xl' : 'hidden -translate-x-full lg:flex')}>
+          <div className="p-3"><Button variant="primary" className="w-full" onClick={() => go('new')}>{Icon.plus}New migration</Button></div>
+          <div className="px-4 pb-1 text-xs font-medium tracking-wide text-zinc-500 uppercase">Projects</div>
+          <div className="flex-1 space-y-0.5 overflow-auto px-2 pb-4">
+            {projects === null && [0, 1, 2].map(i => <div key={i} className="skeleton mx-2 my-2 h-10" />)}
+            {projects?.length === 0 && <p className="px-3 py-2 text-sm text-zinc-500">No projects yet. Start with an example.</p>}
+            {projects?.map(p => (
+              <a key={p.id} href={`#/p/${p.id}`} className={cx('group flex items-center gap-2.5 rounded-lg px-3 py-2 transition-colors', pid === p.id ? 'bg-zinc-100 dark:bg-zinc-800/80' : 'hover:bg-zinc-50 dark:hover:bg-zinc-900')}>
+                <span className={cx('h-2 w-2 shrink-0 rounded-full', statusMeta[p.status]?.dot ?? 'bg-zinc-400')} title={statusMeta[p.status]?.label} />
+                <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{p.name}</span>
+                  <span className="block text-xs text-zinc-500">{p.language === 'cpp' ? 'C++' : 'Python'} · {p.loc} loc · {ago(p.created)}</span></span>
+              </a>
+            ))}
+          </div>
         </aside>
-        <main className="flex-1 min-w-0 overflow-auto p-3 space-y-3">
-          {view === 'benchmark' ? <BenchmarkPanel onUnauthorized={onLogout} /> : <>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-700 overflow-hidden text-sm">
-              {(['cpp', 'python'] as Lang[]).map(l => (
-                <button key={l} onClick={() => setLang(l)} className={`px-3 py-1.5 ${lang === l ? 'bg-orange-600 text-white' : 'hover:bg-slate-100 dark:hover:bg-slate-800'}`}>{l === 'cpp' ? 'C++' : 'Python'}</button>
-              ))}
+        {nav && <div className="absolute inset-0 z-10 bg-black/20 lg:hidden" onClick={() => setNav(false)} />}
+
+        <main className="min-w-0 flex-1 overflow-auto">
+          {(error || sandboxBad) && (
+            <div className="mx-auto max-w-7xl space-y-2 px-4 pt-4 sm:px-6">
+              {sandboxBad && <Alert tone="amber">Sandbox not ready: {health?.sandbox.error}</Alert>}
+              {error && <Alert onClose={() => setError('')}>{error}</Alert>}
             </div>
-            <select className={btn + ' bg-transparent'} value="" onChange={e => { const x = EXAMPLES[Number(e.target.value)]; if (x) { setLang(x.language); setCode(x.code) } }}>
-              <option value="" disabled>Examples…</option>
-              {EXAMPLES.map((x, i) => <option key={x.name} value={i} className="text-black">{x.name}</option>)}
-            </select>
-            <input ref={fileRef} type="file" accept=".py,.cpp,.cc,.cxx,.hpp,.h,.txt" className="hidden" onChange={e => { const f = e.target.files?.[0]; if (f) loadFile(f); e.target.value = '' }} />
-            <button onClick={() => fileRef.current?.click()} className={btn}>Upload file</button>
-            <button onClick={() => { setCode(''); setError('') }} className={btn} disabled={!code}>Clear</button>
-            <span className="text-xs text-slate-500">{code.split('\n').length} lines</span>
-            <button onClick={translate} disabled={running} title="Ctrl+Enter" className="ml-auto rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white px-4 py-1.5 text-sm font-medium">{running ? `Translating… ${elapsed}s` : 'Translate'}</button>
-          </div>
-          {error && <div className="rounded-lg bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300 px-3 py-2 text-sm">{error}</div>}
-          <div className="grid gap-3 xl:grid-cols-[1fr_18rem]">
-            <div className="h-72 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800"
-              onDragOver={e => e.preventDefault()}
-              onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) loadFile(f) }}>
-              <Editor language={lang === 'cpp' ? 'cpp' : 'python'} value={code} onChange={v => setCode(v ?? '')} theme={monacoTheme} options={opts}
-                onMount={(ed, monaco) => ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => translateRef.current())} />
-            </div>
-            <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-2">
-              <div className="text-xs uppercase text-slate-500 px-2 pb-1">Pipeline</div>
-              <Timeline events={events} />
-            </div>
-          </div>
-          {result && (
-            <section className="space-y-2">
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-                <span className={`rounded-full px-3 py-0.5 text-white font-medium ${badge[result.status]}`}>{statusLabel[result.status] ?? result.status}</span>
-                <span>unsafe: {result.unsafe_count}</span>
-                <span>{result.seconds?.toFixed?.(1)}s</span>
-                <span>attempts: {result.attempts}</span>
-                {result.tests_total !== undefined && <span>tests: {result.tests_passed}/{result.tests_total}</span>}
-                {providers && <span className="text-slate-500">providers: {providers}</span>}
-                <button className={btn + ' ml-auto'} onClick={() => { navigator.clipboard.writeText(result.rust); setCopied(true); setTimeout(() => setCopied(false), 1500) }}>{copied ? 'Copied' : 'Copy Rust'}</button>
-                <button className={btn} onClick={downloadProject} disabled={!curId}>Download Cargo project</button>
-              </div>
-              {result.message && <div className="text-sm text-slate-500">{result.message}</div>}
-              {result.status !== 'verified' && result.failures && result.failures.length > 0 && (
-                <details open className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-2 text-sm">
-                  <summary className="cursor-pointer font-medium">Failing tests ({result.failures.length})</summary>
-                  <div className="mt-2 space-y-2">
-                    {result.failures.map((f, i) => (
-                      <div key={i} className="grid gap-2 md:grid-cols-3 text-xs">
-                        {([['Input', f.stdin], ['Expected (original)', f.expected], ['Got (Rust)', f.actual]] as const).map(([title, text]) => (
-                          <div key={title}><div className="uppercase text-slate-500 mb-0.5">{title}</div><pre className="rounded bg-slate-100 dark:bg-slate-800 p-2 whitespace-pre-wrap break-all">{text || '(empty)'}</pre></div>
-                        ))}
-                      </div>
-                    ))}
-                  </div>
-                </details>
-              )}
-              <div className="flex text-xs uppercase text-slate-500"><span className="w-1/2 px-1">Original</span><span className="w-1/2 px-1">Rust</span></div>
-              <div className="h-[28rem] rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800">
-                <DiffEditor original={result.original} modified={result.rust} originalLanguage={lang === 'cpp' ? 'cpp' : 'python'} modifiedLanguage="rust" theme={monacoTheme} options={{ ...opts, readOnly: true, renderSideBySide: true, renderOverviewRuler: false }} />
-              </div>
-            </section>
           )}
-          </>}
+          {page === 'p' && pid ? <ProjectView key={pid} id={pid} tab={tab} theme={theme} go={go} onError={onError} onChanged={refresh} />
+            : page === 'benchmark' ? <Benchmark onError={onError} />
+              : page === 'new' || !projects?.length ? <NewProject theme={theme} onError={onError} onCreated={id => { refresh(); go(`p/${id}`) }} />
+                : <Home projects={projects} go={go} />}
         </main>
+      </div>
+    </div>
+  )
+}
+
+function Home({ projects, go }: { projects: ProjectSummary[]; go: (p: string) => void }) {
+  return (
+    <div className="mx-auto max-w-6xl space-y-6 p-4 sm:p-6">
+      <div className="flex items-center gap-3 animate-fade-in">
+        <div><h1 className="text-2xl font-semibold tracking-tight">Projects</h1><p className="text-sm text-zinc-500">Assess, map, migrate and verify C++ and Python codebases.</p></div>
+        <Button variant="primary" className="ml-auto" onClick={() => go('new')}>{Icon.plus}New migration</Button>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {projects.map(p => (
+          <a key={p.id} href={`#/p/${p.id}`} className="group rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md animate-slide-up dark:border-zinc-800 dark:bg-zinc-900/60">
+            <div className="flex items-center gap-2"><span className={cx('h-2 w-2 rounded-full', statusMeta[p.status]?.dot)} /><span className="truncate font-medium">{p.name}</span></div>
+            <div className="mt-2 text-sm text-zinc-500">{p.language === 'cpp' ? 'C++' : 'Python'} · {p.loc} lines</div>
+            <div className="mt-3 flex items-center justify-between text-xs"><span className="text-zinc-500">{statusMeta[p.status]?.label}</span><span className="text-zinc-400">{ago(p.created)}</span></div>
+          </a>
+        ))}
       </div>
     </div>
   )
