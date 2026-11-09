@@ -104,8 +104,8 @@ class Sandbox:
     async def run(self, cmd: list[str], cwd: str = ".", stdin: str = "", timeout: float | None = None) -> RunResult:
         raise NotImplementedError
 
-    def rust_exe(self) -> str:
-        return f"{self.target_dir}/release/migrated{self.exe_suffix}"
+    def rust_exe(self, name: str = "migrated") -> str:
+        return f"{self.target_dir}/release/{name}{self.exe_suffix}"
 
 
 class DockerSandbox(Sandbox):

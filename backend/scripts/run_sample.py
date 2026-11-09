@@ -28,6 +28,11 @@ async def main(target: str) -> None:
     )
     res = await run_migration(build_project(files), {}, emit)
     print(json.dumps({k: res.get(k) for k in ("status", "confidence", "message", "evidence", "attempts", "usage", "seconds")}, indent=1))
+    for f in res.get("failures", [])[:2]:
+        print("FAILURE input:", repr((f.get("minimized") or f["stdin"])[:200]))
+        print("  expected:", repr(f["expected"][:1500]))
+        print("  actual:  ", repr(f["actual"][:1500]))
+    print("unit:", json.dumps({k: v for k, v in (res.get("unit") or {}).items() if k != "failures"}))
     print("quality:", json.dumps({k: v for k, v in (res.get("quality") or {}).items() if k != "warnings"}))
     for path, code in res.get("files", {}).items():
         print(f"----- {path}\n{code[:1500]}")

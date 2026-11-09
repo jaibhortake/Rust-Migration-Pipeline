@@ -11,5 +11,5 @@ Push-Location "$root\frontend"; npm install --no-audit --no-fund; npm run build;
 
 # Networks that re-sign TLS (e.g. antivirus web shields) need their root CA inside the image build.
 # Put such a CA as sandbox\certs\*.crt (git-ignored) before running this script.
-docker build -t rust-migrator-sandbox:1 "$root\sandbox"
+docker build -t rust-migrator-sandbox:2 "$root\sandbox"
 Write-Host "Setup done. Start with: scripts\start.ps1  (then open http://127.0.0.1:8280)"

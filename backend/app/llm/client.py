@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
+CONTINUE = (
+    "Your reply was cut off by the length limit. Continue EXACTLY where it stopped: do not repeat anything, "
+    "do not restart the code block, and do not add commentary. Finish the code and close the fence."
+)
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -41,7 +47,8 @@ class Usage:
         }
 
 
-async def _groq(messages: list[dict], temperature: float, usage: Usage) -> str:
+async def _groq(messages: list[dict], temperature: float, usage: Usage) -> tuple[str, str]:
+    """Returns (text, finish_reason); finish_reason == 'length' means the reply was cut off."""
     for attempt in range(7):
         try:
             async with httpx.AsyncClient(timeout=180) as client:
@@ -72,7 +79,8 @@ async def _groq(messages: list[dict], temperature: float, usage: Usage) -> str:
         u = data.get("usage") or {}
         usage.prompt_tokens += u.get("prompt_tokens", 0)
         usage.completion_tokens += u.get("completion_tokens", 0)
-        return data["choices"][0]["message"]["content"] or ""
+        choice = data["choices"][0]
+        return choice["message"]["content"] or "", choice.get("finish_reason") or "stop"
     raise LLMError("groq: retries exhausted")
 
 
@@ -95,9 +103,11 @@ async def ollama_model() -> str:
     return pick
 
 
-async def _ollama(messages: list[dict], temperature: float, usage: Usage) -> str:
+async def _ollama(
+    messages: list[dict], temperature: float, usage: Usage, *, timeout: float = 600, num_ctx: int = 16384, max_tokens: int = 4096
+) -> str:
     model = await ollama_model()
-    async with httpx.AsyncClient(timeout=600) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(
             f"{settings.ollama_base_url}/api/chat",
             # think=False: reasoning models (qwen3, deepseek-r1) otherwise spend minutes on hidden reasoning
@@ -106,7 +116,7 @@ async def _ollama(messages: list[dict], temperature: float, usage: Usage) -> str
                 "messages": messages,
                 "stream": False,
                 "think": False,
-                "options": {"temperature": temperature, "num_ctx": 16384},
+                "options": {"temperature": temperature, "num_ctx": num_ctx, "num_predict": max_tokens},
             },
         )
     if r.status_code != 200:
@@ -118,15 +128,16 @@ async def _ollama(messages: list[dict], temperature: float, usage: Usage) -> str
 
 
 def _key(messages: list[dict], temperature: float, variant: int) -> str:
-    raw = json.dumps([settings.groq_model, temperature, variant, messages], sort_keys=True)
+    raw = json.dumps(["v2", settings.groq_model, temperature, variant, messages], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-async def chat(messages: list[dict], usage: Usage | None = None, temperature: float = 0.2, variant: int = 0) -> str:
+async def chat(messages: list[dict], usage: Usage | None = None, temperature: float = 0.2, variant: int = 0, cheap: bool = False) -> str:
     """Groq first, Ollama as fallback. Identical requests are answered from the cache; `variant` distinguishes
     deliberate retries of the same prompt."""
     usage = usage or Usage()
-    key = _key(messages, temperature + 0.1 * variant if variant else temperature, variant)
+    use_local = cheap and settings.cheap_llm == "ollama"
+    key = _key(messages, temperature + 0.1 * variant if variant else temperature, variant) + ("-local" if use_local else "")
     if settings.llm_cache:
         hit = await asyncio.to_thread(db.cache_get, key)
         if hit is not None:
@@ -135,18 +146,41 @@ async def chat(messages: list[dict], usage: Usage | None = None, temperature: fl
             return hit
     usage.calls += 1
     text = None
-    if settings.groq_api_key:
+    if use_local:
+        # Short, forgiving jobs (test-input generation) go to the local model to save the hosted quota.
+        # Anything wrong with it (not running, too slow, no model) silently falls through to Groq.
         try:
-            text = await _groq(messages, min(1.0, temperature + 0.1 * variant), usage)
+            text = await _ollama(
+                messages, min(1.0, temperature + 0.1 * variant), usage, timeout=settings.cheap_timeout_s, num_ctx=8192, max_tokens=1200
+            )
+            if not text.strip():
+                text = None
+            else:
+                usage.providers.add("ollama")
+        except (LLMError, httpx.HTTPError, KeyError, ValueError) as e:
+            log.info("local model skipped (%s), using the hosted model", type(e).__name__)
+            text = None
+    if text is None and settings.groq_api_key:
+        try:
+            temp = min(1.0, temperature + 0.1 * variant)
+            text, finish = await _groq(messages, temp, usage)
+            # Long outputs (a whole translated module) can hit the output limit: ask for the rest and join it.
+            for _ in range(4):
+                if finish != "length":
+                    break
+                more, finish = await _groq(
+                    [*messages, {"role": "assistant", "content": text}, {"role": "user", "content": CONTINUE}], temp, usage
+                )
+                text += more
             usage.providers.add("groq")
         except (LLMError, httpx.HTTPError) as e:
             log.warning("groq failed, falling back to ollama: %s", e)
     if text is None:
         try:
-            text = await _ollama(messages, temperature, usage)
+            text = await _ollama(messages, temperature, usage, timeout=240, num_ctx=8192)
             usage.providers.add("ollama")
         except httpx.HTTPError as e:
-            raise LLMError(f"no LLM available: {e}") from e
+            raise LLMError(f"no LLM available ({type(e).__name__}: {e or 'timed out or unreachable'})") from e
     if settings.llm_cache and text.strip():
         await asyncio.to_thread(db.cache_put, key, text)
     return text

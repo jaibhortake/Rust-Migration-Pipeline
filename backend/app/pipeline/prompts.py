@@ -85,3 +85,64 @@ Warnings:
 BASELINE_SYSTEM = (
     "Translate this program to Rust. Reply with the complete src/main.rs in one ```rust fenced block. Use only the standard library."
 )
+
+
+# ---------------------------------------------------------------- function-level verification
+
+HARNESS_SYSTEM = (
+    "You write a test harness that calls individual functions and class methods of an existing program directly. "
+    "The harness reads calls from stdin, one per line: `<function-or-Class.method> <args...>` with whitespace-separated "
+    "arguments (use a leading count for lists, e.g. `sum_list 3 1 2 3`). For each line it parses the arguments, makes the "
+    "call (for a method: create a fresh object from the constructor arguments given on the same line, then call the "
+    "method) and prints ONE line with the result, or `error` if the call raises/throws. Floats print with fixed 6 decimals; "
+    "booleans as true/false; lists space-separated. Unknown names print `?`. Cover at most 15 callables, preferring "
+    "pure functions and simple methods. Never modify the program's own code. Reply with ONLY the harness in one fenced "
+    "code block."
+)
+
+HARNESS_CPP_RULES = (
+    "The program's source file `{entry}` is ALREADY #included above your code (with its main renamed), so every type and "
+    "function in it is visible. Do NOT include it again; include any standard or project headers you need. Write your own "
+    "`int main()`."
+)
+HARNESS_PY_RULES = (
+    "Import what you need from these project modules: {modules}. The entry module is `{entry_module}`; it is safe to "
+    'import (its main code is guarded by `if __name__ == "__main__"`).'
+)
+
+UNIT_TESTS_SYSTEM = (
+    "You design stdin inputs for a test harness. Reply with ONLY a JSON array of 6 to 10 strings; each string is the full "
+    "stdin of one harness run, containing 3 to 12 call lines in the harness's format. Cover every callable, normal values, "
+    "edge cases (empty lists, zero, negatives, repeated values, boundaries) and error cases."
+)
+
+RUST_HARNESS_TASK = """Translate this {lang} test harness into Rust as `src/harness.rs`.
+It must expose `pub fn run()` that reads ALL of stdin and handles each call line exactly like the original harness
+(same parsing, same output text and formatting, `error` where the original catches an exception).
+The crate's items are available through `use crate::...`: modules are declared at the crate root; items defined in
+`main.rs` are `crate::Name`; private items of modules are not reachable, so use only what the listing below shows.
+
+Crate API:
+{api}
+
+Original harness:
+```
+{harness}
+```"""
+
+FIX_HARNESS = """The Rust harness did not compile. Fix `src/harness.rs` only. Reply with ONE ```rust block whose FIRST line is
+`// file: src/harness.rs` containing the complete corrected file.
+
+Compiler output:
+{errors}"""
+
+FIX_HARNESS_MISMATCH = """The Rust harness and the original harness print different results for these calls. First check the
+Rust HARNESS against the original harness (argument parsing, output format); fix `src/harness.rs` if that is where the
+difference comes from. Reply with ONE ```rust block whose FIRST line is `// file: src/harness.rs` containing the complete file.
+
+stdin:
+{stdin}
+original harness output:
+{expected}
+Rust harness output:
+{actual}"""

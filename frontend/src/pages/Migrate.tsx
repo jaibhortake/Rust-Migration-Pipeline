@@ -4,8 +4,8 @@ import Timeline from '../components/Timeline'
 import { Alert, Badge, Button, Card, Empty, Icon, Spinner, statusMeta } from '../components/ui'
 import { fmtSecs, useElapsed } from '../hooks'
 
-export default function Migrate({ project, job, starting, onStart, onReport }: {
-  project: Project; job: Job | null; starting: boolean; onStart: () => void; onReport: () => void
+export default function Migrate({ project, job, starting, onStart, onResume, onReport }: {
+  project: Project; job: Job | null; starting: boolean; onStart: () => void; onResume: () => void; onReport: () => void
 }) {
   const running = job?.status === 'running'
   const elapsed = useElapsed(running)
@@ -36,8 +36,15 @@ export default function Migrate({ project, job, starting, onStart, onReport }: {
             <Timeline events={job.events} />
             {done && (
               <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-zinc-100 pt-4 dark:border-zinc-800 animate-fade-in">
-                {done.message ? <span className="text-sm text-zinc-600 dark:text-zinc-400">{String(done.message)}</span> : null}
+                {job.result?.explanation ? (
+                  <div className="basis-full">
+                    <p className="text-sm font-medium">{job.result.explanation.title}</p>
+                    <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">{job.result.explanation.detail}</p>
+                    {job.result.explanation.next_steps.length > 0 && <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-sm">{job.result.explanation.next_steps.map(t => <li key={t}>{t}</li>)}</ul>}
+                  </div>
+                ) : done.message ? <span className="text-sm text-zinc-600 dark:text-zinc-400">{String(done.message)}</span> : null}
                 <div className="ml-auto flex gap-2">
+                  {job.resumable && job.status !== 'equivalent' && <Button onClick={onResume} disabled={starting} title="Reuses the recorded tests and the modules that already compiled">Resume from checkpoint</Button>}
                   <Button onClick={onStart} disabled={starting}>Run again</Button>
                   {job.result?.files && Object.keys(job.result.files).length > 0 && <Button variant="primary" onClick={onReport}>View report →</Button>}
                 </div>

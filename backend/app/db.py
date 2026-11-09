@@ -17,10 +17,10 @@ _conn: sqlite3.Connection | None = None
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL, files TEXT NOT NULL,
-  assessment TEXT NOT NULL, mappings TEXT NOT NULL, created REAL NOT NULL);
+  assessment TEXT NOT NULL, mappings TEXT NOT NULL, created REAL NOT NULL, manifest TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  status TEXT NOT NULL, events TEXT NOT NULL, result TEXT, created REAL NOT NULL);
+  status TEXT NOT NULL, events TEXT NOT NULL, result TEXT, created REAL NOT NULL, checkpoint TEXT);
 CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project_id);
 CREATE TABLE IF NOT EXISTS llm_cache (key TEXT PRIMARY KEY, text TEXT NOT NULL, created REAL NOT NULL);
 """
@@ -36,6 +36,14 @@ def connect(path=None) -> sqlite3.Connection:
         _conn.execute("PRAGMA foreign_keys = ON")
         _conn.execute("PRAGMA journal_mode = WAL") if str(p) != ":memory:" else None
         _conn.executescript(SCHEMA)
+        try:
+            _conn.execute("ALTER TABLE projects ADD COLUMN manifest TEXT NOT NULL DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass  # column exists
+        try:
+            _conn.execute("ALTER TABLE jobs ADD COLUMN checkpoint TEXT")
+        except sqlite3.OperationalError:
+            pass
     return _conn
 
 
@@ -50,10 +58,10 @@ def _q(sql: str, args: tuple = ()) -> list[tuple]:
 # ---- projects
 
 
-def insert_project(pid: str, name: str, language: str, files: dict, assessment: dict, mappings: dict) -> None:
+def insert_project(pid: str, name: str, language: str, files: dict, assessment: dict, mappings: dict, manifest: dict) -> None:
     _q(
-        "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (pid, name, language, json.dumps(files), json.dumps(assessment), json.dumps(mappings), time.time()),
+        "INSERT INTO projects (id, name, language, files, assessment, mappings, created, manifest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (pid, name, language, json.dumps(files), json.dumps(assessment), json.dumps(mappings), time.time(), json.dumps(manifest)),
     )
 
 
@@ -62,7 +70,7 @@ def update_mappings(pid: str, mappings: dict) -> None:
 
 
 def get_project(pid: str) -> dict | None:
-    rows = _q("SELECT id, name, language, files, assessment, mappings, created FROM projects WHERE id = ?", (pid,))
+    rows = _q("SELECT id, name, language, files, assessment, mappings, created, manifest FROM projects WHERE id = ?", (pid,))
     if not rows:
         return None
     r = rows[0]
@@ -74,6 +82,7 @@ def get_project(pid: str) -> dict | None:
         "assessment": json.loads(r[4]),
         "mappings": json.loads(r[5]),
         "created": r[6],
+        "manifest": json.loads(r[7]),
     }
 
 
@@ -102,8 +111,17 @@ def save_job(jid: str, project_id: str, status: str, events: list[dict], result:
     )
 
 
+def save_checkpoint(jid: str, data: dict) -> None:
+    _q("UPDATE jobs SET checkpoint = ? WHERE id = ?", (json.dumps(data), jid))
+
+
+def get_checkpoint(jid: str) -> dict | None:
+    rows = _q("SELECT checkpoint FROM jobs WHERE id = ?", (jid,))
+    return json.loads(rows[0][0]) if rows and rows[0][0] else None
+
+
 def get_job(jid: str) -> dict | None:
-    rows = _q("SELECT id, project_id, status, events, result, created FROM jobs WHERE id = ?", (jid,))
+    rows = _q("SELECT id, project_id, status, events, result, created, checkpoint IS NOT NULL FROM jobs WHERE id = ?", (jid,))
     if not rows:
         return None
     r = rows[0]
@@ -114,6 +132,7 @@ def get_job(jid: str) -> dict | None:
         "events": json.loads(r[3]),
         "result": json.loads(r[4]) if r[4] else None,
         "created": r[5],
+        "resumable": bool(r[6]),
     }
 
 

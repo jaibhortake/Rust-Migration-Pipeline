@@ -85,6 +85,7 @@ class FileSymbols:
     complexity: int = 1
     has_entrypoint: bool = False
     syntax_errors: list[int] = field(default_factory=list)
+    has_calls: bool = False
     imports: list[Import] = field(default_factory=list)
     classes: list[ClassInfo] = field(default_factory=list)
     functions: list[Function] = field(default_factory=list)
@@ -140,6 +141,8 @@ def extract(language: str, path: str, code: str) -> FileSymbols:
     tree = parse_tree(language, code)
     fs = FileSymbols(path=path, loc=len([ln for ln in code.splitlines() if ln.strip()]))
     for n in walk(tree.root_node):
+        if n.type in ("call", "call_expression"):
+            fs.has_calls = True
         if (n.is_error or n.is_missing) and len(fs.syntax_errors) < 5:
             fs.syntax_errors.append(n.start_point[0] + 1)
     fs.complexity = _complexity(language, tree.root_node)

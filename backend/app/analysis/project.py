@@ -5,6 +5,7 @@ import posixpath
 import zipfile
 from dataclasses import dataclass, field
 
+from app.analysis.manifest import manifest_kind, parse_cmake, parse_requirements, select_cmake_target
 from app.config import settings
 
 EXTS = {"python": (".py",), "cpp": (".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h", ".hxx")}
@@ -21,6 +22,7 @@ class ProjectError(ValueError):
 class Project:
     language: str
     files: dict[str, str] = field(default_factory=dict)  # posix relative path -> text
+    manifest: dict = field(default_factory=dict)  # parsed requirements.txt / CMakeLists.txt
 
     @property
     def loc(self) -> int:
@@ -50,11 +52,19 @@ def build_project(files: dict[str, str], language: str | None = None) -> Project
         raise ProjectError("no source files")
     cleaned: dict[str, str] = {}
     langs = set()
+    manifest: dict = {}
     for raw, text in files.items():
         path = clean_path(raw)
+        kind = manifest_kind(path)
+        if kind == "requirements" and "requirements" not in manifest:
+            manifest["requirements"] = parse_requirements(text)
+            continue
+        if kind == "cmake" and "cmake" not in manifest:
+            manifest["cmake"] = parse_cmake(text, posixpath.dirname(path))
+            continue
         lang = language_of(path)
         if lang is None:
-            continue  # ignore READMEs, build files, ...
+            continue  # ignore READMEs, other build files, ...
         if len(text) > settings.max_file_chars:
             raise ProjectError(f"{path} is larger than {settings.max_file_chars} characters")
         langs.add(lang)
@@ -70,7 +80,14 @@ def build_project(files: dict[str, str], language: str | None = None) -> Project
         raise ProjectError(f"too many files ({len(cleaned)} > {settings.max_files})")
     if sum(len(t) for t in cleaned.values()) > settings.max_upload_bytes:
         raise ProjectError("project is too large")
-    return Project(lang, dict(sorted(cleaned.items())))
+    if lang == "cpp" and manifest.get("cmake"):
+        target, sources = select_cmake_target(manifest["cmake"], set(cleaned))
+        if sources:
+            cleaned = {p: t for p, t in cleaned.items() if not p.endswith(CPP_SOURCES) or p in sources}
+            manifest["cmake"]["selected_target"] = target
+    if lang != "python":
+        manifest.pop("requirements", None)
+    return Project(lang, dict(sorted(cleaned.items())), manifest)
 
 
 def files_from_zip(data: bytes) -> dict[str, str]:
@@ -83,7 +100,7 @@ def files_from_zip(data: bytes) -> dict[str, str]:
     out: dict[str, str] = {}
     total = 0
     for info in zf.infolist():
-        if info.is_dir() or language_of(info.filename) is None:
+        if info.is_dir() or (language_of(info.filename) is None and manifest_kind(info.filename) is None):
             continue
         parts = info.filename.replace("\\", "/").split("/")
         if any(p in SKIP_DIRS for p in parts):

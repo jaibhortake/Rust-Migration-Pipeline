@@ -108,3 +108,58 @@ def test_clippy_parse_and_score():
 def test_crates_only_from_allowlist():
     deps = crates_for([{"kind": "crate", "crates": ["regex", "evil-crate"]}, {"kind": "std", "crates": ["serde"]}])
     assert deps == ['regex = "1"']
+
+
+def test_coverage_checkpoint_roundtrip():
+    cov = Coverage({("a.py", 1), ("a.py", 2)}, {("a.py", 1), ("a.py", 2), ("a.py", 3)}, {("a.py", 2, 0)}, {("a.py", 2, 0), ("a.py", 2, 1)})
+    back = Coverage.from_dict(json.loads(json.dumps(cov.to_dict())))
+    assert back.lines == cov.lines and back.all_branches == cov.all_branches and back.line_rate == cov.line_rate
+
+
+def test_extract_block_handles_truncated_reply():
+    from app.pipeline.runner import extract_block
+
+    assert extract_block("```rust\nfn main() {\n    let x").startswith("fn main() {")
+    assert extract_block("intro ```rust\nfn a() {}\n``` outro") == "fn a() {}\n"
+
+
+def test_waves_run_independent_modules_together():
+    from app.pipeline.runner import Migration
+
+    units = {
+        "a": {"deps": []},
+        "b": {"deps": []},
+        "c": {"deps": ["a", "b"]},
+        "m_main": {"deps": ["c"]},
+    }
+    order = [["a"], ["b"], ["c"], ["m_main"]]
+    waves = Migration._waves(None, order, units, "m_main")
+    assert waves == [[["a"], ["b"]], [["c"]], [["m_main"]]]
+
+
+def test_contract_adherence_and_explanations():
+    from app.pipeline.explain import contract_adherence, explain
+
+    mappings = {
+        "classes": [
+            {"name": "Shape", "strategy": "trait"},
+            {"name": "Circle", "strategy": "implementor"},
+            {"name": "Rect", "strategy": "implementor"},
+            {"name": "Oops", "strategy": "error"},
+        ],
+        "libraries": [{"source": "re", "kind": "crate", "crates": ["regex"]}, {"source": "random", "kind": "unsupported", "crates": []}],
+    }
+    rust = {
+        "src/shape.rs": "pub trait Shape { fn area(&self) -> f64; }\n",
+        "src/main.rs": "struct Circle;\nimpl Shape for Circle { }\nstruct Rect;\n",
+    }
+    c = contract_adherence(mappings, rust)
+    by = {r["name"] + r["kind"]: r for r in c["rows"]}
+    assert by["Shapeclass"]["followed"] and by["Circleclass"]["followed"]
+    assert not by["Rectclass"]["followed"] and "without a trait impl" in by["Rectclass"]["detail"]
+    assert not by["Oopsclass"]["followed"] and not by["relibrary"]["followed"] and by["randomlibrary"]["followed"]
+    assert c["followed"] == 3 and c["total"] == 6
+
+    assert explain({"status": "failed", "message": "the original C++ does not compile"})["title"].startswith("Your C++")
+    assert "Nothing to compare" == explain({"status": "failed", "message": "the original program prints nothing on every input"})["title"]
+    assert explain({"status": "equivalent", "confidence": "high"})["title"].startswith("Behaviour matches")

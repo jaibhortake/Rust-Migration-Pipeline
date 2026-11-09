@@ -26,6 +26,8 @@ from app.config import ROOT, settings
 from app.llm.client import LLMError, Usage, chat
 from app.mapping.libraries import crates_for
 from app.pipeline import prompts
+from app.pipeline.explain import contract_adherence, explain
+from app.pipeline.unit import UnitVerifier
 from app.sandbox import RunResult, Sandbox, SandboxError, make_sandbox
 from app.verify.coverage import Coverage, parse_coveragepy, parse_gcov_dir
 from app.verify.fuzz import minimize, mutations
@@ -34,6 +36,11 @@ from app.verify.quality import parse_clippy, score
 Emit = Callable[[str, str, dict], Awaitable[None]]
 WORKSPACE = ROOT / "workspace"
 MAX_SOURCE_CHARS = 40_000
+FORCE_INCLUDES = [
+    flag
+    for h in ("cstdint", "cstddef", "utility", "algorithm", "limits", "numeric", "memory", "functional", "string", "vector", "stdexcept")
+    for flag in ("-include", h)
+]
 
 
 def cargo_toml(deps: list[str]) -> str:
@@ -49,7 +56,11 @@ def cargo_toml(deps: list[str]) -> str:
 
 def extract_block(text: str, lang: str = "rust") -> str:
     m = re.search(rf"```(?:{lang})?[ \t]*\n(.*?)```", text, re.DOTALL)
-    return (m.group(1) if m else text).strip() + "\n"
+    if m:
+        return m.group(1).strip() + "\n"
+    # unclosed fence (reply cut off): drop the opening fence line and keep the rest
+    m = re.match(rf"\s*```(?:{lang})?[ \t]*\n", text)
+    return (text[m.end() :] if m else text).strip() + "\n"
 
 
 def extract_files(text: str, default: str | None = None) -> dict[str, str]:
@@ -130,24 +141,58 @@ def parse_json_list(text: str) -> list[str] | None:
 
 
 class Migration:
-    def __init__(self, project: Project, mappings: dict, emit: Emit, job_dir: Path, sandbox: Sandbox):
+    def __init__(
+        self,
+        project: Project,
+        mappings: dict,
+        emit: Emit,
+        job_dir: Path,
+        sandbox: Sandbox,
+        resume: dict | None = None,
+        on_checkpoint: Callable[[dict], Awaitable[None]] | None = None,
+    ):
         self.project, self.mappings, self.emit = project, mappings, emit
+        self.resume = resume or {}
+        self.on_checkpoint = on_checkpoint
         self.d, self.sb = job_dir, sandbox
         self.usage = Usage()
         self.assessment: dict = {}
         self.cases: list[dict] = []  # {stdin, expected, origin}
         self.total_cov = Coverage()
         self.flaky = 0
+        self.no_input = False
         self.rust: dict[str, str] = {}  # "src/x.rs" -> code
         self.modules: list[dict] = []
         self.failures: list[dict] = []
         self.counters = {"module_fixes": 0, "verify_rounds": 0, "refine_accepted": False}
         self.result: dict = {"status": "failed", "message": ""}
+        self.orig_seconds = 0.0
+        if self.resume.get("cases"):  # restore what an interrupted run already established
+            self.cases = list(self.resume["cases"])
+            self.total_cov = Coverage.from_dict(self.resume.get("coverage", {}))
+            self.no_input = bool(self.resume.get("no_input"))
+            self.flaky = int(self.resume.get("flaky", 0))
+            self.orig_seconds = float(self.resume.get("orig_seconds", 0.0))
+            self.rust = dict(self.resume.get("rust", {}))
+
+    async def save_checkpoint(self) -> None:
+        if self.on_checkpoint and self.cases:
+            await self.on_checkpoint(
+                {
+                    "cases": self.cases,
+                    "coverage": self.total_cov.to_dict(),
+                    "no_input": self.no_input,
+                    "flaky": self.flaky,
+                    "orig_seconds": self.orig_seconds,
+                    "rust": {p: t for p, t in self.rust.items() if p != "src/main.rs"},
+                    "modules": self.modules,
+                }
+            )
 
     # ---- LLM
-    async def ask(self, system: str, user: str, history: list[dict] | None = None, variant: int = 0) -> str:
+    async def ask(self, system: str, user: str, history: list[dict] | None = None, variant: int = 0, cheap: bool = False) -> str:
         msgs = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user}]
-        return await chat(msgs, self.usage, variant=variant)
+        return await chat(msgs, self.usage, variant=variant, cheap=cheap)
 
     # ---- stage 0: function-only input gets a driver
     async def prepare(self) -> bool:
@@ -192,31 +237,45 @@ class Migration:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(t, encoding="utf-8", newline="\n")
         (self.d / "cov").mkdir()
+        note = ""
         if self.project.language == "cpp":
-            (orig / "obj").mkdir()
-            sources = [p for p in self.project.files if p.endswith(CPP_SOURCES)]
-            self.objs = []
-            for s in sources:
-                obj = "obj/" + s.replace("/", "__").rsplit(".", 1)[0] + ".o"
-                r = await self.sb.run(
-                    ["g++", "-std=c++20", "-O0", "--coverage", "-I", ".", "-c", s, "-o", obj], "orig", timeout=settings.build_timeout_s
-                )
-                if not r.ok:
-                    return await self._orig_fail(r)
-                self.objs.append(obj)
-            r = await self.sb.run(["g++", "--coverage", *self.objs, "-o", "cov_bin"], "orig", timeout=settings.build_timeout_s)
-            if not r.ok:
-                return await self._orig_fail(r)
-            r = await self.sb.run(
-                ["g++", "-std=c++20", "-O2", "-I", ".", *sources, "-o", "plain_bin"], "orig", timeout=settings.build_timeout_s
-            )
-            if not r.ok:
-                return await self._orig_fail(r)
+            err = await self._build_cpp([])
+            if err is not None:
+                # Code written against a newer standard library often omits headers that older ones pull in
+                # indirectly (e.g. <utility> for std::exchange). Retry with the common ones force-included.
+                retry_err = await self._build_cpp(FORCE_INCLUDES)
+                if retry_err is not None:
+                    return await self._orig_fail(err)
+                note = "compiled after force-including common standard headers the source does not include itself"
         entry = self.assessment["graph"]["entry"]
         units = self.assessment["graph"]["units"]
         self.entry_files = units[entry]["files"] if entry else list(self.project.files)
-        await self.emit("build_original", "ok", {})
+        await self.emit("build_original", "ok", {"note": note} if note else {})
         return True
+
+    async def _build_cpp(self, extra: list[str]) -> RunResult | None:
+        """Builds cov_bin (instrumented) and plain_bin. Returns the failing RunResult, or None on success."""
+        orig = self.d / "orig"
+        shutil.rmtree(orig / "obj", ignore_errors=True)
+        (orig / "obj").mkdir()
+        sources = [p for p in self.project.files if p.endswith(CPP_SOURCES)]
+        self.objs = []
+        cm = self.project.manifest.get("cmake") or {}
+        std = cm.get("std") if cm.get("std") in (11, 14, 17, 20, 23) else 20
+        dirs = [x for d in cm.get("include_dirs", []) for x in ("-I", d)]
+        base = ["g++", f"-std=c++{std}", "-I", ".", *dirs, *extra]
+        self.cpp_base = base
+        for s in sources:
+            obj = "obj/" + s.replace("/", "__").rsplit(".", 1)[0] + ".o"
+            r = await self.sb.run([*base, "-O0", "--coverage", "-c", s, "-o", obj], "orig", timeout=settings.build_timeout_s)
+            if not r.ok:
+                return r
+            self.objs.append(obj)
+        r = await self.sb.run(["g++", "--coverage", *self.objs, "-o", "cov_bin"], "orig", timeout=settings.build_timeout_s)
+        if not r.ok:
+            return r
+        r = await self.sb.run([*base, "-O2", *sources, "-o", "plain_bin"], "orig", timeout=settings.build_timeout_s)
+        return None if r.ok else r
 
     async def _orig_fail(self, r: RunResult) -> bool:
         await self.emit("build_original", "failed", {"errors": r.stderr[-2000:]})
@@ -274,12 +333,25 @@ class Migration:
         self.cases.append({"stdin": stdin, "expected": r.stdout, "origin": origin})
         return True
 
+    async def _single_run(self) -> bool:
+        """The program reads no input: its behaviour is one deterministic run, so test generation is pointless."""
+        self.no_input = True
+        await self.emit("tests", "running", {"phase": "program reads no input: recording its single run"})
+        runs = [0]
+        if not await self._try_input("", "no-input", False, runs):
+            await self.emit("tests", "failed", {"errors": "the original program failed when run"})
+            self.result["message"] = "the original program failed or timed out when run"
+            return False
+        return True
+
     async def generate_tests(self) -> bool:
+        if not self.assessment["summary"].get("reads_stdin", True):
+            return await self._single_run()
         await self.emit("tests", "running", {"phase": "seed inputs"})
         runs = [0]
         listing = self._source_listing()
         for attempt in range(3):
-            text = await self.ask(prompts.TESTS_SYSTEM, f"Program ({self.project.language}):\n{listing}", variant=attempt)
+            text = await self.ask(prompts.TESTS_SYSTEM, f"Program ({self.project.language}):\n{listing}", variant=attempt, cheap=True)
             inputs = parse_json_list(text) or []
             for s in inputs[:14]:
                 await self._try_input(s, "llm", False, runs)
@@ -294,7 +366,7 @@ class Migration:
         rng = random.Random(1234)
         seeds = [c["stdin"] for c in self.cases]
         i = 0
-        while runs[0] < settings.exploration_runs and len(self.cases) < settings.max_tests and seeds:
+        while runs[0] < settings.exploration_runs and len(self.cases) < settings.max_tests and seeds and not settings.off("targeting"):
             if self.total_cov.line_rate >= 0.999 and (self.total_cov.branch_rate or 1) >= 0.999:
                 break
             seed = seeds[i % len(seeds)]
@@ -305,7 +377,7 @@ class Migration:
             if i > len(seeds) * 3:
                 break
 
-        for rnd in range(settings.targeted_rounds):
+        for rnd in range(0 if settings.off("targeting") else settings.targeted_rounds):
             if self.total_cov.line_rate >= settings.coverage_target or len(self.cases) >= settings.max_tests:
                 break
             await self.emit(
@@ -351,12 +423,15 @@ class Migration:
                 "line_coverage": round(self.total_cov.line_rate, 3),
                 "branch_coverage": None if self.total_cov.branch_rate is None else round(self.total_cov.branch_rate, 3),
                 "flaky_dropped": self.flaky,
+                "no_input": self.no_input,
             },
         )
         return True
 
     # ---- stage 3: module-by-module translation
     def _contract(self, unit: dict, done: list[str]) -> str:
+        if settings.off("contract"):
+            return ""
         files = set(unit["files"])
         m = self.mappings
         lines = ["Migration contract (follow it):"]
@@ -393,11 +468,11 @@ class Migration:
                     lines.append(f"mod {uid}:\n{public_api(self.rust[path])}")
         return "\n".join(lines)
 
-    async def _cargo(self, sub: str) -> RunResult:
+    async def _cargo(self, sub: str, cwd: str = "rust") -> RunResult:
         cmd = ["cargo", sub, "--release", "--quiet", "--color", "never"]
         if self.sb.name == "docker":
             cmd.append("--offline")
-        return await self.sb.run(cmd, "rust", timeout=settings.build_timeout_s)
+        return await self.sb.run(cmd, cwd, timeout=settings.build_timeout_s)
 
     def _write_rust(self) -> None:
         src = self.d / "rust" / "src"
@@ -413,7 +488,9 @@ class Migration:
             self.rust["src/main.rs"] = "#![allow(dead_code, unused_imports)]\nfn main() {}\n"
         self.rust["src/main.rs"] = with_mods(self.rust["src/main.rs"], mods)
 
-    async def _compile_fix(self, label: str, default_path: str, attempts: int, check: bool) -> tuple[bool, RunResult]:
+    async def _compile_fix(
+        self, label: str, default_path: str, attempts: int, check: bool, paths: list[str] | None = None
+    ) -> tuple[bool, RunResult]:
         r = RunResult(1, "", "")
         history: list[dict] = []
         for attempt in range(attempts + 1):
@@ -432,7 +509,11 @@ class Migration:
                 {"module": label, "fix_attempt": attempt + 1, "errors": r.stderr[-1200:]},
             )
             user = prompts.FIX_COMPILE.format(errors=r.stderr[-5000:])
-            ctx = "\n\n".join(f"```rust\n// file: {p}\n{t}```" for p, t in self.rust.items() if p == default_path or p == "src/main.rs")
+            ctx = "\n\n".join(
+                f"```rust\n// file: {p}\n{t}```"
+                for p, t in self.rust.items()
+                if p == default_path or p in (paths or ()) or p == "src/main.rs"
+            )
             text = await self.ask(prompts.TRANSLATE_SYSTEM.format(lang=self._lang), ctx + "\n\n" + user, history)
             history = (history + [{"role": "user", "content": user}, {"role": "assistant", "content": text}])[-4:]
             for p, t in extract_files(text, default_path).items():
@@ -446,54 +527,87 @@ class Migration:
     def _lang(self) -> str:
         return "C++" if self.project.language == "cpp" else "Python"
 
+    def _waves(self, order: list[list[str]], units: dict, entry: str) -> list[list[list[str]]]:
+        """Groups of mutually independent dependency groups: every group depends only on earlier waves, so the
+        modules inside one wave can be translated at the same time. The entry module is always the last wave."""
+        gid = {u: i for i, grp in enumerate(order) for u in grp}
+        level: dict[int, int] = {}
+        for i, grp in enumerate(order):
+            deps = {gid[d] for u in grp for d in units[u]["deps"] if d in gid and gid[d] != i}
+            level[i] = 1 + max((level[j] for j in deps if j in level), default=-1)
+        waves: dict[int, list[list[str]]] = {}
+        for i, grp in enumerate(order):
+            if entry in grp:
+                continue
+            waves.setdefault(level[i], []).append(grp)
+        out = [waves[k] for k in sorted(waves)]
+        out.append([[entry]])
+        return out
+
+    async def _translate_unit(self, uid: str, units: dict, entry: str, done: list[str], sem: asyncio.Semaphore) -> dict:
+        u = units[uid]
+        is_entry = uid == entry
+        target = "src/main.rs" if is_entry else f"src/{uid}.rs"
+        system = prompts.TRANSLATE_SYSTEM.format(lang=self._lang)
+        async with sem:
+            await self.emit("translate", "running", {"module": uid, "target": target})
+            source = chr(10).join(f"// ===== {f}{chr(10)}{self.project.files[f]}" for f in u["files"])[:MAX_SOURCE_CHARS]
+            task = prompts.MODULE_TASK.format(
+                lang=self._lang,
+                unit=uid,
+                files=", ".join(u["files"]),
+                target=target,
+                role=prompts.ROLE_ENTRY if is_entry else prompts.ROLE_MODULE,
+                contract=self._contract(u, done),
+                source=source,
+            )
+            code = ""
+            for attempt in range(2):
+                code = extract_block(await self.ask(system, task, variant=attempt))
+                if code.strip() and (not is_entry or "fn main" in code):
+                    break
+        self.rust[target] = code
+        return {"id": uid, "files": u["files"], "rust": target, "status": "translated", "fixes": 0}
+
     async def translate(self) -> bool:
         g = self.assessment["graph"]
         units = {u["id"]: u for u in self.assessment["units"]}
-        crate_deps = crates_for(self.mappings.get("libraries", []))
         (self.d / "rust").mkdir(exist_ok=True)
-        (self.d / "rust" / "Cargo.toml").write_text(cargo_toml(crate_deps), encoding="utf-8")
-        done: list[str] = []
+        (self.d / "rust" / "Cargo.toml").write_text(cargo_toml(crates_for(self.mappings.get("libraries", []))), encoding="utf-8")
         entry = g["entry"] or next(iter(units))
-        order = [grp for grp in g["order"]]
-        system = prompts.TRANSLATE_SYSTEM.format(lang=self._lang)
-        for grp in order:
-            for uid in grp:
-                u = units[uid]
-                is_entry = uid == entry
-                target = "src/main.rs" if is_entry else f"src/{uid}.rs"
-                await self.emit("translate", "running", {"module": uid, "target": target})
-                source = "\n\n".join(f"// ===== {f}\n{self.project.files[f]}" for f in u["files"])[:MAX_SOURCE_CHARS]
-                task = prompts.MODULE_TASK.format(
-                    lang=self._lang,
-                    unit=uid,
-                    files=", ".join(u["files"]),
-                    target=target,
-                    role=prompts.ROLE_ENTRY if is_entry else prompts.ROLE_MODULE,
-                    contract=self._contract(u, done),
-                    source=source,
-                )
-                code = ""
-                for attempt in range(2):
-                    code = extract_block(await self.ask(system, task, variant=attempt))
-                    if code.strip() and (not is_entry or "fn main" in code):
-                        break
-                self.rust[target] = code
-                self.modules.append({"id": uid, "files": u["files"], "rust": target, "status": "translated", "fixes": 0})
-            # compile gate after each dependency group (a cycle is checked as a whole)
-            if all(uid != entry for uid in grp):
-                before = self.counters["module_fixes"]
-                self._assemble(partial=True)
-                ok, r = await self._compile_fix(",".join(grp), f"src/{grp[-1]}.rs", settings.max_module_fix_attempts, check=True)
-                for m in self.modules:
-                    if m["id"] in grp:
-                        m["status"] = "compiles" if ok else "failed"
-                        m["fixes"] = self.counters["module_fixes"] - before
-                if not ok:
-                    await self.emit("translate", "failed", {"module": ",".join(grp), "errors": r.stderr[-2000:]})
-                    self.result.update(status="compile_failed", message=f"module {','.join(grp)} does not compile")
-                    return False
-                await self.emit("translate", "ok", {"module": ",".join(grp)})
-            done += [x for x in grp if x != entry]
+        sem = asyncio.Semaphore(max(1, settings.parallel_translate))
+        done: list[str] = []
+        resumed = {m["id"]: m for m in self.resume.get("modules", []) if m.get("status") == "compiles"}
+        for wave in self._waves(g["order"], units, entry):
+            uids = [u for grp in wave for u in grp]
+            if all(u in resumed and f"src/{u}.rs" in self.rust for u in uids if u != entry):
+                if entry not in uids:
+                    self.modules += [resumed[u] for u in uids]
+                    done += uids
+                    await self.emit("translate", "ok", {"module": ",".join(uids), "note": "resumed from checkpoint"})
+                    continue
+            results = await asyncio.gather(*(self._translate_unit(u, units, entry, done, sem) for u in uids))
+            self.modules += results
+            if entry in uids:
+                continue  # the entry module is compiled together with the whole crate in the next stage
+            before = self.counters["module_fixes"]
+            self._assemble(partial=True)
+            label = ",".join(uids)
+            ok, r = await self._compile_fix(
+                label, f"src/{uids[-1]}.rs", settings.max_module_fix_attempts, check=True, paths=[f"src/{u}.rs" for u in uids]
+            )
+            for m in self.modules:
+                if m["id"] in uids:
+                    m["status"] = "compiles" if ok else "failed"
+                    m["fixes"] = self.counters["module_fixes"] - before
+            if not ok:
+                await self.emit("translate", "failed", {"module": label, "errors": r.stderr[-2000:]})
+                self.result.update(status="compile_failed", message=f"module {label} does not compile")
+                await self.save_checkpoint()
+                return False
+            await self.emit("translate", "ok", {"module": label})
+            done += uids
+            await self.save_checkpoint()
         self._assemble(partial=False)
         return True
 
@@ -504,7 +618,7 @@ class Migration:
     async def verify(self) -> bool:
         history: list[dict] = []
         system = prompts.TRANSLATE_SYSTEM.format(lang=self._lang)
-        rounds = settings.max_verify_attempts
+        rounds = 0 if settings.off("repair") else settings.max_verify_attempts
         for rnd in range(rounds + 1):
             self.counters["verify_rounds"] = rnd + 1
             await self.emit("compile", "running", {"round": rnd + 1})
@@ -549,7 +663,7 @@ class Migration:
                 rr = await self.run_rust(s)
                 return not rr.ok or compare(o.stdout, rr.stdout) == "diff"
 
-            small = await minimize(first_fail["stdin"], still_fails, budget=30)
+            small = first_fail["stdin"] if settings.off("minimize") else await minimize(first_fail["stdin"], still_fails, budget=30)
             o, _ = await self.run_original(small, coverage=False)
             rr = await self.run_rust(small)
             self.failures[0]["minimized"] = small[:2000]
@@ -630,7 +744,6 @@ class Migration:
     # ---- orchestrate
     async def run(self) -> dict:
         t0 = time.monotonic()
-        self.orig_seconds = 0.0
         self.passed = self.numeric = 0
         self.rust_seconds = 0.0
         quality = None
@@ -639,11 +752,29 @@ class Migration:
             if not await self.prepare():
                 return self._finish(t0, quality)
             await self.sb.start()
-            if not await self.build_original() or not await self.generate_tests():
+            if not await self.build_original():
                 return self._finish(t0, quality)
+            if self.resume.get("cases"):
+                await self.emit(
+                    "tests",
+                    "ok",
+                    {
+                        "count": len(self.cases),
+                        "line_coverage": round(self.total_cov.line_rate, 3),
+                        "branch_coverage": None if self.total_cov.branch_rate is None else round(self.total_cov.branch_rate, 3),
+                        "flaky_dropped": self.flaky,
+                        "note": "resumed from checkpoint",
+                    },
+                )
+            elif not await self.generate_tests():
+                return self._finish(t0, quality)
+            else:
+                await self.save_checkpoint()
             if not await self.translate():
                 return self._finish(t0, quality)
             equivalent = await self.verify()
+            if equivalent and settings.unit_tests and not settings.off("unit"):
+                self.result["unit"] = await UnitVerifier(self).run()
             if self.result.get("status") != "compile_failed":
                 quality = await self.quality(equivalent)
                 self.result["status"] = "equivalent" if equivalent else "partial"
@@ -665,7 +796,10 @@ class Migration:
         st = self.result["status"]
         if st == "equivalent":
             cov = lc or 0
-            confidence = "high" if cov >= 0.9 and len(self.cases) >= 8 else "medium" if cov >= 0.7 else "low"
+            enough = len(self.cases) >= 8 or self.no_input  # a program with no input has exactly one behaviour to check
+            confidence = "high" if cov >= 0.9 and enough else "medium" if cov >= 0.7 else "low"
+            if (self.result.get("unit") or {}).get("status") == "partial" and confidence == "high":
+                confidence = "medium"  # direct calls to some functions disagree
         else:
             confidence = "none"
         origins: dict[str, int] = {}
@@ -701,23 +835,31 @@ class Migration:
                 "attempts": self.counters,
                 "usage": self.usage.to_dict(),
                 "tests": self.cases[: settings.max_tests],
+                "contract": contract_adherence(self.mappings, self.rust),
                 "sandbox": self.sb.name,
                 "seconds": round(time.monotonic() - t0, 1),
             }
         )
+        self.result["explanation"] = explain(self.result)
         return self.result
 
 
 _slots = asyncio.Semaphore(settings.max_concurrent_jobs)
 
 
-async def run_migration(project: Project, mappings: dict, emit: Emit) -> dict:
+async def run_migration(
+    project: Project,
+    mappings: dict,
+    emit: Emit,
+    resume: dict | None = None,
+    on_checkpoint: Callable[[dict], Awaitable[None]] | None = None,
+) -> dict:
     WORKSPACE.mkdir(exist_ok=True)
     job_dir = Path(tempfile.mkdtemp(dir=WORKSPACE))
     try:
         async with _slots:
             await emit("queue", "ok", {})
-            m = Migration(project, mappings, emit, job_dir, make_sandbox(job_dir))
+            m = Migration(project, mappings, emit, job_dir, make_sandbox(job_dir), resume, on_checkpoint)
             result = await m.run()
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)

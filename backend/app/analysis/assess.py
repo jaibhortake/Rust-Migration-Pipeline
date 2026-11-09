@@ -3,6 +3,7 @@
 import re
 
 from app.analysis.graph import build_graph
+from app.analysis.manifest import import_name
 from app.analysis.project import Project
 from app.analysis.risks import SEVERITY_WEIGHT, find_risks
 from app.analysis.symbols import FileSymbols, extract
@@ -18,6 +19,33 @@ def looks_like_source(language: str, code: str) -> bool:
     if language == "cpp":
         return ";" in code and "{" in code
     return bool(re.search(r"^\s*(def|class|import|from|for|while|if|print)\b|\w\s*=\s*\S", code, re.M))
+
+
+STDIN_RE = {
+    "cpp": re.compile(r"\b(cin|scanf|getline|getchar|gets|fgets|fread|read)\s*\(|\bcin\b|\bstdin\b|istream_iterator|\bstd::cin\b"),
+    "python": re.compile(r"\binput\s*\(|\bstdin\b|fileinput"),
+}
+
+
+def reads_stdin(language: str, files: dict[str, str]) -> bool:
+    rx = STDIN_RE[language]
+    return any(rx.search(t) for t in files.values())
+
+
+def _manifest_summary(m: dict) -> dict:
+    out: dict = {}
+    if "requirements" in m:
+        out["requirements"] = m["requirements"]
+    if "cmake" in m:
+        c = m["cmake"]
+        out["cmake"] = {
+            "std": c.get("std"),
+            "selected_target": c.get("selected_target"),
+            "targets": list(c.get("targets", {})),
+            "include_dirs": c.get("include_dirs", []),
+            "packages": c.get("packages", []),
+        }
+    return out
 
 
 def analyze(project: Project) -> tuple[dict, dict]:
@@ -60,8 +88,19 @@ def analyze(project: Project) -> tuple[dict, dict]:
             for f in u.files:
                 if f not in files and any(i.module == ext or i.module.split(".")[0] == ext for i in symbols[f].imports):
                     files.append(f)
+    declared: list[str] = []
+    if project.language == "python":
+        for pkg in project.manifest.get("requirements", []):
+            imp = import_name(pkg)
+            if any(imp.lower() == k.split(".")[0].lower() for k in used):
+                continue  # already mapped from an actual import
+            used[imp] = []
+            declared.append(pkg)
     big_ints = any(r.rule == "big-int" for r in all_risks)
     libs = map_libraries(project.language, used, big_ints)
+    for lib in libs:
+        if lib.source in declared or any(import_name(d) == lib.source for d in declared):
+            lib.note = ("declared in requirements.txt but not imported by the code. " + lib.note).strip()
     types = [t.to_dict() for t in map_types(project.language, project.files)]
     if any(r.rule == "dict-order" for r in all_risks):
         for t in types:
@@ -84,7 +123,7 @@ def analyze(project: Project) -> tuple[dict, dict]:
                 f"{', '.join(text_like)} does not look like {'C++' if project.language == 'cpp' else 'Python'} source code. "
                 "It may be a program's output or plain text: upload the source file instead."
             )
-    elif not any(s.functions or s.classes for s in symbols.values()):
+    elif not any(s.functions or s.classes or s.has_calls for s in symbols.values()):
         blockers.append("No functions or classes found: there is no code to migrate.")
     entries = [u for u in graph.units.values() if u.is_entry]
     if len(entries) > 1:
@@ -122,6 +161,8 @@ def analyze(project: Project) -> tuple[dict, dict]:
             "blockers": blockers,
             "unsupported": unsupported,
             "single_function": len(project.files) == 1 and not entries and not blockers,
+            "reads_stdin": reads_stdin(project.language, project.files),
+            "manifest": _manifest_summary(project.manifest),
         },
         "graph": graph.to_dict(),
         "units": units,

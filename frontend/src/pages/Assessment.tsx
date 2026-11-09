@@ -37,6 +37,16 @@ export default function Assessment({ project, theme }: { project: Project; theme
         <Stat label="Manual effort" value={`${s.manual_hours}h`} hint="heuristic: 30 LOC/h × risk" />
       </div>
 
+      {(s.manifest?.requirements || s.manifest?.cmake || s.reads_stdin === false) && (
+        <Card title="Project manifest">
+          <div className="space-y-2 text-sm">
+            {s.manifest?.cmake && <p><b>CMakeLists.txt</b>: C++{s.manifest.cmake.std ?? 'default'}{s.manifest.cmake.selected_target ? <>, migrating target <code className="font-mono">{s.manifest.cmake.selected_target}</code> of {s.manifest.cmake.targets.length}</> : null}{s.manifest.cmake.include_dirs.length ? <>, include dirs: {s.manifest.cmake.include_dirs.join(', ')}</> : null}</p>}
+            {s.manifest?.requirements && <p><b>requirements.txt</b>: {s.manifest.requirements.join(', ') || 'none'}</p>}
+            {s.reads_stdin === false && <p><b>No input:</b> the program never reads stdin, so its behaviour is one deterministic run. Test generation is skipped and the output is compared once.</p>}
+          </div>
+        </Card>
+      )}
+
       <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
         <Card title="Dependency graph" action={<span className="text-xs text-zinc-500">migrated left → right · hover to trace</span>}>
           <DepGraph units={a.units} order={a.graph.order} />

@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-120b"
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "llama3.2"
+    cheap_llm: str = "ollama"  # "ollama": short jobs (test inputs) use the local model; "groq": everything hosted
+    cheap_timeout_s: int = 150
     llm_cache: bool = True  # identical prompts reuse the stored answer (saves quota during benchmarks)
 
     # Auth
@@ -26,7 +28,7 @@ class Settings(BaseSettings):
 
     # Sandbox: "docker" (isolated, default) or "local" (runs on the host; development only)
     sandbox: str = "docker"
-    sandbox_image: str = "rust-migrator-sandbox:1"
+    sandbox_image: str = "rust-migrator-sandbox:2"
     sandbox_memory: str = "1536m"
     sandbox_cpus: str = "2"
     sandbox_pids: int = 256
@@ -41,12 +43,19 @@ class Settings(BaseSettings):
     max_output_bytes: int = 1_000_000
 
     # Pipeline budgets
+    # Benchmark switches, comma separated: contract, targeting, minimize, repair, unit (turn a feature off)
+    ablate: str = ""
+    unit_tests: bool = True  # function-level verification after the program-level check passes
+    parallel_translate: int = 3  # modules translated at the same time (LLM calls only)
     max_module_fix_attempts: int = 3
     max_verify_attempts: int = 4
     coverage_target: float = 0.95
     max_tests: int = 40
     exploration_runs: int = 80
     targeted_rounds: int = 2
+
+    def off(self, feature: str) -> bool:
+        return feature in {x.strip() for x in self.ablate.split(",")}
 
 
 settings = Settings()

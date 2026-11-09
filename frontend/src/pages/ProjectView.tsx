@@ -56,9 +56,9 @@ export default function ProjectView({ id, tab, theme, go, onError, onChanged }: 
     return () => { alive = false; ws.current?.close(); ws.current = null }
   }, [id, onError, watch])
 
-  const start = async () => {
+  const start = async (resume?: string) => {
     setStarting(true)
-    try { const { id: jid } = await api.migrate(id); watch(jid); onChanged(); go(`p/${id}/migrate`) } catch (e) { onError(e) } finally { setStarting(false) }
+    try { const { id: jid } = await api.migrate(id, resume); watch(jid); onChanged(); go(`p/${id}/migrate`) } catch (e) { onError(e) } finally { setStarting(false) }
   }
 
   if (!project) return (
@@ -108,7 +108,7 @@ export default function ProjectView({ id, tab, theme, go, onError, onChanged }: 
       <div key={active} className="animate-fade-in">
         {active === 'assessment' && <Assessment project={project} theme={theme} />}
         {active === 'mappings' && <Mappings project={project} onError={onError} onSaved={m => setProject(p => (p ? { ...p, mappings: m } : p))} />}
-        {active === 'migrate' && <Migrate project={project} job={job} starting={starting} onStart={start} onReport={() => go(`p/${id}/report`)} />}
+        {active === 'migrate' && <Migrate project={project} job={job} starting={starting} onStart={() => start()} onResume={() => start(job?.id)} onReport={() => go(`p/${id}/report`)} />}
         {active === 'report' && <Report project={project} job={job} theme={theme} />}
       </div>
     </div>

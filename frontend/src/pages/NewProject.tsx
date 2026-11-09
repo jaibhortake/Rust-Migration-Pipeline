@@ -4,7 +4,7 @@ import { api, type Example, type Lang } from '../api'
 import { Alert, Badge, Button, Card, cx, Icon, Spinner, Tabs } from '../components/ui'
 import type { Theme } from '../hooks'
 
-const SOURCE_RE = /\.(py|cpp|cc|cxx|h|hpp|hh|hxx|zip)$/i
+const SOURCE_RE = /(\.(py|cpp|cc|cxx|h|hpp|hh|hxx|zip)|(^|\/)(requirements\.txt|CMakeLists\.txt))$/i
 
 export default function NewProject({ theme, onCreated, onError }: { theme: Theme; onCreated: (id: string) => void; onError: (e: unknown) => void }) {
   const [mode, setMode] = useState<'paste' | 'upload'>('paste')
@@ -23,7 +23,7 @@ export default function NewProject({ theme, onCreated, onError }: { theme: Theme
 
   const addFiles = (list: FileList | File[]) => {
     const ok = Array.from(list).filter(f => SOURCE_RE.test(f.name))
-    if (!ok.length) { setErr('Choose .py, .cpp/.h files or a .zip of a project.'); return }
+    if (!ok.length) { setErr('Choose .py, .cpp/.h files, requirements.txt, CMakeLists.txt or a .zip of a project.'); return }
     setErr(''); setPicked(null); setMode('upload')
     setFiles(prev => [...prev.filter(p => !ok.some(o => o.name === p.name)), ...ok])
   }
@@ -92,8 +92,8 @@ export default function NewProject({ theme, onCreated, onError }: { theme: Theme
                   drag ? 'border-brand-500 bg-brand-50 dark:bg-brand-500/10' : 'border-zinc-300 hover:border-zinc-400 dark:border-zinc-700')}>
                 <span className="text-zinc-400">{Icon.upload}</span>
                 <div className="font-medium">Drop source files or a .zip here</div>
-                <div className="text-sm text-zinc-500">.py or .cpp/.h · up to 60 files · 1 MB · one language per project</div>
-                <input ref={input} type="file" multiple accept=".py,.cpp,.cc,.cxx,.h,.hpp,.hh,.hxx,.zip" className="hidden"
+                <div className="text-sm text-zinc-500">.py or .cpp/.h · optional requirements.txt / CMakeLists.txt · up to 60 files · 1 MB · one language per project</div>
+                <input ref={input} type="file" multiple accept=".py,.cpp,.cc,.cxx,.h,.hpp,.hh,.hxx,.zip,.txt" className="hidden"
                   onChange={e => { if (e.target.files) addFiles(e.target.files); e.target.value = '' }} />
               </div>
               {files.length > 0 && (

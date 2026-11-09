@@ -9,6 +9,7 @@ const STAGES: { id: string; label: string; help: string }[] = [
   { id: 'translate', label: 'Translate modules', help: 'Leaves first, following the contract; each group must compile before the next' },
   { id: 'compile', label: 'Build crate', help: 'cargo build of the whole crate, with compiler-guided repair' },
   { id: 'verify', label: 'Differential testing', help: 'Run Rust and original on every input and compare; minimise failures and repair' },
+  { id: 'unit', label: 'Function-level checks', help: 'Call individual functions in the original and in Rust with generated arguments (optional)' },
   { id: 'quality', label: 'Quality', help: 'clippy + rustfmt; clippy fixes are kept only if every test still passes' },
 ]
 
@@ -38,6 +39,8 @@ function detail(id: string, e?: PipelineEvent): string {
   if (id === 'verify' && e.phase) return String(e.phase)
   if (id === 'compile' && e.fix_attempt) return `repairing compile errors (attempt ${e.fix_attempt})`
   if (id === 'compile' && e.round) return `round ${e.round}`
+  if (id === 'unit' && e.total != null) return `${e.passed}/${e.total} call sequences match`
+  if (id === 'unit' && e.phase) return String(e.phase)
   if (id === 'quality' && e.score != null) return `score ${e.score}/100 · ${e.clippy} clippy warnings`
   if (id === 'prepare' && e.note) return String(e.note)
   if (id === 'prepare' && e.units) return `${e.units} modules`

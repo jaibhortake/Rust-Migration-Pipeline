@@ -9,7 +9,7 @@ foreach ($p in ".tools", "backend\.venv", "backend\data", "frontend\node_modules
 Get-ChildItem $root -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     docker ps -aq --filter "label=rust-migrator=1" | ForEach-Object { docker rm -f $_ | Out-Null }
-    docker image rm -f rust-migrator-sandbox:1 2>$null | Out-Null
+    docker image rm -f rust-migrator-sandbox:2 2>$null | Out-Null
     docker builder prune -af 2>$null | Out-Null
     Write-Host "removed sandbox image and build cache"
 }

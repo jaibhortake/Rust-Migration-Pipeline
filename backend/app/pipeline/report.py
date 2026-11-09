@@ -24,6 +24,10 @@ def report_markdown(name: str, project: dict, res: dict) -> str:
         f"**Confidence:** {res.get('confidence', 'none')}  ",
         f"**Sandbox:** {res.get('sandbox', '?')}, **time:** {res.get('seconds', 0)} s",
         "",
+        f"## {(res.get('explanation') or {}).get('title', 'Summary')}",
+        (res.get("explanation") or {}).get("detail", ""),
+        *[f"- {step}" for step in (res.get("explanation") or {}).get("next_steps", [])],
+        "",
         '## What "equivalent" means here',
         "The Rust program produced the same standard output as the original on every recorded input "
         f"({ev.get('tests_passed', 0)}/{ev.get('tests_total', 0)}). This is test-based behavioural evidence, not a "
@@ -37,6 +41,8 @@ def report_markdown(name: str, project: dict, res: dict) -> str:
         f"- Matches that needed float tolerance (1e-9 relative): {ev.get('numeric_matches', 0)}",
         f"- Non-deterministic inputs dropped: {ev.get('flaky_dropped', 0)}",
     ]
+    if ev.get("no_input"):
+        lines.append("- The program reads no input, so its behaviour is a single deterministic run (compared once).")
     unc = ev.get("uncovered") or {}
     if unc:
         lines.append(
@@ -58,6 +64,19 @@ def report_markdown(name: str, project: dict, res: dict) -> str:
             f"- {a.get('files')} files, {a.get('loc')} lines, {a.get('classes')} classes, readiness: {a.get('readiness')}",
             f"- Risks: {a.get('risks')}",
             f"- Manual effort estimate: {a.get('manual_hours')} hours",
+        ]
+    ct = res.get("contract") or {}
+    if ct.get("rows"):
+        lines += [
+            "",
+            f"## Migration contract: followed {ct['followed']}/{ct['total']} decisions",
+            "| kind | name | expected | followed | where |",
+            "|---|---|---|---|---|",
+        ]
+        lines += [
+            f"| {r['kind']} | {r['name']} | {r['expected']} | {'yes' if r['followed'] else 'NO'} | "
+            f"{r.get('where') or r.get('detail') or ''} |"
+            for r in ct["rows"]
         ]
     mods = res.get("modules") or []
     if mods:

@@ -1,6 +1,6 @@
 # Sandbox image: every compile and every run of user code happens inside a container made from this.
 # Containers get no network, memory/CPU/pids limits, no capabilities and a non-root user (see app/sandbox.py).
-FROM rust:1-slim-bookworm
+FROM rust:1-slim-trixie
 
 # Optional extra root CAs (*.crt) for networks that re-sign TLS, e.g. antivirus web shields.
 # Only used while building the image; certs/*.crt is git-ignored.

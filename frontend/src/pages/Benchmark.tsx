@@ -25,6 +25,20 @@ export default function Benchmark({ onError }: { onError: (e: unknown) => void }
         <Stat label="Mean line coverage" value={pct(t.mean_line_coverage)} hint="of the originals, by the recorded tests" />
         <Stat label="Mean quality score" value={t.mean_quality != null ? Math.round(t.mean_quality) : '—'} hint="clippy / unsafe / unwrap density" />
       </div>
+      {t.ablations && Object.keys(t.ablations).length > 0 && (
+        <Card title="What each feature contributes" pad={false} action={<span className="text-xs text-zinc-500">same programs, one feature switched off at a time</span>}>
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs text-zinc-500"><tr><th className="px-4 py-2 font-medium">Configuration</th><th className="font-medium">Equivalent</th><th className="font-medium">Mean coverage</th><th className="px-4 font-medium">Mean quality</th></tr></thead>
+            <tbody>
+              <tr className="border-t border-zinc-100 dark:border-zinc-800"><td className="px-4 py-2 font-medium">full pipeline</td><td className="tabular-nums">{t.pipeline_equivalent}/{b.rows.length}</td><td className="tabular-nums">{pct(t.mean_line_coverage)}</td><td className="px-4 tabular-nums">{t.mean_quality != null ? Math.round(t.mean_quality) : '—'}</td></tr>
+              {Object.entries(t.ablations).map(([k, v]) => (
+                <tr key={k} className="border-t border-zinc-100 dark:border-zinc-800"><td className="px-4 py-2 font-mono text-xs">{k}</td><td className="tabular-nums">{v.equivalent}/{t.programs ?? 0}</td><td className="tabular-nums">{pct(v.mean_line_coverage)}</td><td className="px-4 tabular-nums">{v.mean_quality != null ? Math.round(v.mean_quality) : '—'}</td></tr>
+              ))}
+              <tr className="border-t border-zinc-100 dark:border-zinc-800"><td className="px-4 py-2 font-medium">one-shot LLM baseline</td><td className="tabular-nums">{t.baseline_equivalent}/{b.rows.length}</td><td className="text-zinc-400">—</td><td className="px-4 text-zinc-400">—</td></tr>
+            </tbody>
+          </table>
+        </Card>
+      )}
       <Card pad={false}>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">

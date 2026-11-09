@@ -13,6 +13,23 @@ class Coverage:
     branches: set[tuple[str, int, int]] = field(default_factory=set)  # taken branch arcs
     all_branches: set[tuple[str, int, int]] = field(default_factory=set)
 
+    def to_dict(self) -> dict:
+        return {
+            "lines": sorted(self.lines),
+            "all_lines": sorted(self.all_lines),
+            "branches": sorted(self.branches),
+            "all_branches": sorted(self.all_branches),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Coverage":
+        return cls(
+            {tuple(x) for x in d.get("lines", [])},
+            {tuple(x) for x in d.get("all_lines", [])},
+            {tuple(x) for x in d.get("branches", [])},
+            {tuple(x) for x in d.get("all_branches", [])},
+        )
+
     def merge(self, other: "Coverage") -> None:
         self.lines |= other.lines
         self.all_lines |= other.all_lines

@@ -1,10 +1,18 @@
-"""Benchmark: full pipeline vs a one-shot LLM baseline on every sample (single files and multi-file projects).
+"""Benchmark the pipeline against a one-shot LLM baseline and against itself with one feature switched off.
 
-Both are scored on the SAME inputs, recorded from the original program by the pipeline's test generation.
-The baseline is what "just ask an LLM" gives you: one call, whole source in, main.rs out, no analysis, no repair.
+    cd backend && .venv/Scripts/python -m scripts.benchmark [--configs full,baseline,no-contract,...] [--only NAME] [--limit N]
 
-    cd backend && .venv/Scripts/python -m scripts.benchmark [--only NAME] [--limit N]
-Calls the LLM (cached in SQLite, so re-runs are cheap).
+Configurations:
+  full          everything on
+  baseline      ONE LLM call, whole source in, main.rs out: no analysis, contract, tests-guided repair or compile fixes
+  no-contract   translator gets no class/library/type contract and no hazard notes
+  no-targeting  no mutation fuzzing and no coverage-targeted test prompts (LLM seed inputs only)
+  no-minimize   failing inputs are not shrunk before the repair prompt
+  no-repair     no behavioural repair rounds: translate, fix compile errors, compare once
+  no-unit       skip the function-level check
+
+Every configuration is scored on its own recorded tests; the baseline is scored on the full run's tests, so it is judged
+on the same inputs. Results are cached in SQLite by prompt, so re-runs are cheap. Writes backend/benchmark_results.json.
 """
 
 import argparse
@@ -24,6 +32,7 @@ from app.sandbox import make_sandbox
 
 SAMPLES = ROOT / "samples"
 OUT = ROOT / "backend" / "benchmark_results.json"
+ABLATIONS = {"no-contract": "contract", "no-targeting": "targeting", "no-minimize": "minimize", "no-repair": "repair", "no-unit": "unit"}
 
 
 def collect() -> list[tuple[str, str, dict[str, str]]]:
@@ -69,61 +78,103 @@ async def quiet(*_a) -> None:
     pass
 
 
+def summarize(res: dict, seconds: float) -> dict:
+    ev = res.get("evidence", {})
+    return {
+        "status": res["status"],
+        "tests_passed": ev.get("tests_passed", 0),
+        "tests_total": ev.get("tests_total", 0),
+        "line_coverage": ev.get("line_coverage"),
+        "branch_coverage": ev.get("branch_coverage"),
+        "quality": (res.get("quality") or {}).get("score"),
+        "seconds": round(seconds, 1),
+        "llm_calls": res.get("usage", {}).get("calls", 0) + res.get("usage", {}).get("cached", 0),
+        "repairs": res.get("attempts", {}),
+        "contract_followed": (res.get("contract") or {}).get("followed"),
+        "contract_total": (res.get("contract") or {}).get("total"),
+        "unit": (res.get("unit") or {}).get("status"),
+    }
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--configs", default="full,baseline", help="comma list; see the module docstring")
     ap.add_argument("--only", help="substring of the sample name")
     ap.add_argument("--limit", type=int)
     args = ap.parse_args()
+    configs = [c.strip() for c in args.configs.split(",") if c.strip()]
+    unknown = [c for c in configs if c not in ("full", "baseline", *ABLATIONS)]
+    if unknown:
+        raise SystemExit(f"unknown configs: {unknown}")
     items = [i for i in collect() if not args.only or args.only in i[0]][: args.limit]
     rows = []
     for name, kind, files in items:
         project = build_project(files)
-        t0 = time.time()
-        res = await run_migration(project, {}, quiet)
-        ev = res.get("evidence", {})
-        row = {
-            "name": name,
-            "language": project.language,
-            "kind": kind,
-            "loc": project.loc,
-            "pipeline": {
-                "status": res["status"],
-                "tests_passed": ev.get("tests_passed", 0),
-                "tests_total": ev.get("tests_total", 0),
-                "line_coverage": ev.get("line_coverage"),
-                "branch_coverage": ev.get("branch_coverage"),
-                "quality": (res.get("quality") or {}).get("score"),
-                "seconds": round(time.time() - t0, 1),
-                "llm_calls": res.get("usage", {}).get("calls", 0) + res.get("usage", {}).get("cached", 0),
-                "repairs": res.get("attempts", {}),
-            },
-            "baseline": {"status": "skipped", "tests_passed": 0, "tests_total": 0},
-        }
-        if res.get("tests"):
+        row: dict = {"name": name, "language": project.language, "kind": kind, "loc": project.loc, "ablations": {}}
+        full_res = None
+        for cfg in configs:
+            if cfg == "baseline":
+                continue
+            settings.ablate = ABLATIONS.get(cfg, "")
+            t0 = time.time()
+            res = await run_migration(build_project(files), {}, quiet)
+            settings.ablate = ""
+            summary = summarize(res, time.time() - t0)
+            if cfg == "full":
+                row["pipeline"], full_res = summary, res
+            else:
+                row["ablations"][cfg] = summary
+        if "full" not in configs:
+            row["pipeline"] = {"status": "skipped", "tests_passed": 0, "tests_total": 0, "seconds": 0, "llm_calls": 0}
+        row["baseline"] = {"status": "skipped", "tests_passed": 0, "tests_total": 0}
+        if "baseline" in configs and full_res and full_res.get("tests"):
             try:
-                row["baseline"] = await baseline(res["original_files"], project.language, res["tests"])
-            except Exception as e:  # baseline failures must not stop the benchmark
-                row["baseline"] = {"status": "failed", "tests_passed": 0, "tests_total": len(res["tests"]), "error": str(e)[:200]}
+                row["baseline"] = await baseline(full_res["original_files"], project.language, full_res["tests"])
+            except Exception as e:  # a baseline failure must not stop the benchmark
+                row["baseline"] = {"status": "failed", "tests_passed": 0, "tests_total": len(full_res["tests"]), "error": str(e)[:200]}
         rows.append(row)
         p, b = row["pipeline"], row["baseline"]
+        abl = " ".join(f"{k}={v['status'][:4]}" for k, v in row["ablations"].items())
         print(
-            f"{name:<34} pipeline {p['status']:<14} {p['tests_passed']}/{p['tests_total']} cov {p['line_coverage']}  "
-            f"baseline {b['status']:<14} {b['tests_passed']}/{b['tests_total']}  {p['seconds']}s",
+            f"{name:<30} full {p['status']:<14} {p['tests_passed']}/{p['tests_total']} cov {p.get('line_coverage')}  "
+            f"baseline {b['status']:<12} {abl}",
             flush=True,
         )
 
-    covs = [r["pipeline"]["line_coverage"] for r in rows if r["pipeline"]["line_coverage"] is not None]
-    quals = [r["pipeline"]["quality"] for r in rows if r["pipeline"]["quality"] is not None]
+    def mean(xs):
+        xs = [x for x in xs if x is not None]
+        return round(sum(xs) / len(xs), 3) if xs else None
+
     totals = {
+        "programs": len(rows),
         "pipeline_equivalent": sum(r["pipeline"]["status"] == "equivalent" for r in rows),
         "baseline_equivalent": sum(r["baseline"]["status"] == "equivalent" for r in rows),
-        "mean_line_coverage": round(sum(covs) / len(covs), 3) if covs else None,
-        "mean_quality": round(sum(quals) / len(quals), 1) if quals else None,
+        "mean_line_coverage": mean(r["pipeline"].get("line_coverage") for r in rows),
+        "mean_quality": mean(r["pipeline"].get("quality") for r in rows),
+        "mean_llm_calls": mean(r["pipeline"].get("llm_calls") for r in rows),
+        "ablations": {
+            cfg: {
+                "equivalent": sum(r["ablations"].get(cfg, {}).get("status") == "equivalent" for r in rows),
+                "mean_line_coverage": mean(r["ablations"].get(cfg, {}).get("line_coverage") for r in rows),
+                "mean_quality": mean(r["ablations"].get(cfg, {}).get("quality") for r in rows),
+            }
+            for cfg in configs
+            if cfg in ABLATIONS
+        },
     }
     OUT.write_text(
-        json.dumps({"generated": time.strftime("%Y-%m-%d %H:%M"), "model": settings.groq_model, "rows": rows, "totals": totals}, indent=1)
+        json.dumps(
+            {
+                "generated": time.strftime("%Y-%m-%d %H:%M"),
+                "model": settings.groq_model,
+                "configs": configs,
+                "rows": rows,
+                "totals": totals,
+            },
+            indent=1,
+        )
     )
-    print(json.dumps(totals))
+    print(json.dumps(totals, indent=1))
 
 
 if __name__ == "__main__":

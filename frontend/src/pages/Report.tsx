@@ -32,11 +32,18 @@ export default function Report({ project, job, theme }: { project: Project; job:
           <span className="text-sm text-zinc-600 dark:text-zinc-400">{fmtSecs(r.seconds)} · sandbox: {r.sandbox} · {r.usage.calls} LLM calls{r.usage.cached ? ` (+${r.usage.cached} cached)` : ''}</span>
           <div className="ml-auto flex gap-2">
             <Button onClick={() => { navigator.clipboard.writeText(r.files[current] ?? ''); setCopied(true); setTimeout(() => setCopied(false), 1500) }}>{copied ? 'Copied' : 'Copy file'}</Button>
+            <Button onClick={() => { window.location.href = `/api/jobs/${job.id}/report` }}>Report only (.md)</Button>
             <Button variant="primary" onClick={() => { window.location.href = `/api/jobs/${job.id}/download` }}>{Icon.download}Download Cargo project</Button>
           </div>
         </div>
         <p className="mt-3 text-sm">{confText[r.confidence]}</p>
-        {r.message && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{r.message}</p>}
+        {r.explanation && (
+          <div className="mt-3 rounded-lg bg-white/60 p-3 dark:bg-zinc-950/40">
+            <p className="text-sm font-medium">{r.explanation.title}</p>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{r.explanation.detail}</p>
+            {r.explanation.next_steps.length > 0 && <ul className="mt-2 list-disc space-y-0.5 pl-5 text-sm">{r.explanation.next_steps.map(s => <li key={s}>{s}</li>)}</ul>}
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -46,6 +53,8 @@ export default function Report({ project, job, theme }: { project: Project; job:
         <Stat label="Branch coverage" value={pct(ev.branch_coverage)} tone={(ev.branch_coverage ?? 0) >= 0.8 ? 'good' : 'warn'} hint={ev.flaky_dropped ? `${ev.flaky_dropped} nondeterministic inputs dropped` : 'decision outcomes exercised'} />
         <Stat label="Repairs" value={r.attempts.module_fixes + r.attempts.verify_rounds - 1} hint={`${r.attempts.module_fixes} compile · ${Math.max(0, r.attempts.verify_rounds - 1)} behavioural`} />
       </div>
+
+      {ev.no_input && <Alert tone="blue">This program reads no input, so its behaviour is a single deterministic run. It was compared once, and the coverage figures show how much of the code that run executed. No test inputs were generated.</Alert>}
 
       <div className="grid gap-6 lg:grid-cols-[1fr_1fr]">
         {q && (
@@ -84,6 +93,47 @@ export default function Report({ project, job, theme }: { project: Project; job:
           )}
         </Card>
       </div>
+
+      {r.contract && r.contract.rows.length > 0 && (
+        <Card title={`Migration contract: followed ${r.contract.followed} of ${r.contract.total} decisions`} pad={false}
+          action={<span className="text-xs text-zinc-500">what the translator did with each class / library decision</span>}>
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-white text-left text-xs text-zinc-500 dark:bg-zinc-900"><tr><th className="px-4 py-2 font-medium">Decision</th><th className="font-medium">Expected</th><th className="font-medium">Result</th><th className="px-4 font-medium">Where</th></tr></thead>
+              <tbody>
+                {r.contract.rows.map((c, i) => (
+                  <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <td className="px-4 py-1.5"><span className="font-mono text-xs">{c.name}</span> <Badge>{c.kind}</Badge></td>
+                    <td className="text-xs text-zinc-600 dark:text-zinc-400">{c.expected}</td>
+                    <td><Badge tone={c.followed ? 'green' : 'amber'}>{c.followed ? 'followed' : 'deviated'}</Badge></td>
+                    <td className="px-4 font-mono text-xs text-zinc-500">{c.where || c.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {r.unit && (
+        <Card title="Function-level verification" action={<Badge tone={r.unit.status === 'equivalent' ? 'green' : r.unit.status === 'partial' ? 'amber' : 'zinc'}>{r.unit.status}</Badge>}>
+          {r.unit.status === 'skipped' ? (
+            <p className="text-sm text-zinc-600 dark:text-zinc-400">Not run: {r.unit.reason}</p>
+          ) : (
+            <div className="space-y-3 text-sm">
+              <p>Individual functions were called directly with generated arguments in both the original and the Rust: <b>{r.unit.tests_passed}/{r.unit.tests_total}</b> calls matched, line coverage of the original with these calls <b>{pct(r.unit.line_coverage)}</b>{r.unit.coverage_gain ? <> (+{pct(r.unit.coverage_gain)} beyond what the program run reaches)</> : null}.</p>
+              <div className="flex flex-wrap gap-1">{r.unit.functions.map(f => <Badge key={f}>{f}</Badge>)}</div>
+              {r.unit.failures.map((f, i) => (
+                <div key={i} className="grid gap-3 md:grid-cols-3">
+                  <div><div className="mb-1 text-xs font-medium text-zinc-500">Call</div><Pre>{f.stdin}</Pre></div>
+                  <div><div className="mb-1 text-xs font-medium text-zinc-500">Original</div><Pre>{f.expected || '(empty)'}</Pre></div>
+                  <div><div className="mb-1 text-xs font-medium text-zinc-500">Rust</div><Pre>{f.actual || '(empty)'}</Pre></div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
 
       {r.failures.length > 0 && (
         <Card title={`Remaining differences (${r.failures.length})`}>

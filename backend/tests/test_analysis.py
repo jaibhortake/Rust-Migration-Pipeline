@@ -153,3 +153,44 @@ def test_program_output_pasted_as_source_is_blocked_not_wrapped():
 def test_file_without_any_code_is_blocked():
     a, _ = analyze(build_project({"x.py": "# just a comment\nX = 1\n"}))
     assert a["summary"]["readiness"] == "blocked" and not a["summary"]["single_function"]
+
+
+def test_requirements_and_cmake_manifests():
+    from app.analysis.manifest import parse_cmake, parse_requirements
+
+    assert parse_requirements("numpy>=1.2  # fast\nrequests[security]==2.0\n-r other.txt\nPyYAML\n") == ["numpy", "requests", "pyyaml"]
+    cm = parse_cmake(
+        "set(CMAKE_CXX_STANDARD 17)\nadd_executable(app main.cpp util.cpp)\nadd_executable(tool tool.cpp)\n"
+        "include_directories(include)\nfind_package(Threads)\n",
+        "",
+    )
+    assert cm["std"] == 17 and cm["targets"]["app"]["sources"] == ["main.cpp", "util.cpp"] and cm["include_dirs"] == ["include"]
+
+    files = {
+        "CMakeLists.txt": "add_executable(app main.cpp util.cpp)\nadd_executable(tool tool.cpp)\n",
+        "main.cpp": '#include "util.h"\nint main(){return f();}\n',
+        "util.cpp": "int f(){return 1;}\n",
+        "util.h": "int f();\n",
+        "tool.cpp": "int main(){return 0;}\n",
+    }
+    p = build_project(files)
+    assert set(p.files) == {"main.cpp", "util.cpp", "util.h"} and p.manifest["cmake"]["selected_target"] == "app"
+    a, _ = analyze(p)  # two mains would have been a blocker without the CMake target selection
+    assert not a["summary"]["blockers"]
+
+
+def test_requirements_flag_unsupported_libraries_up_front():
+    files = {"requirements.txt": "pandas\nnumpy\n", "main.py": "import sys\nprint(sys.argv)\n"}
+    a, m = analyze(build_project(files))
+    kinds = {x["source"]: x["kind"] for x in m["libraries"]}
+    assert kinds["pandas"] == "unsupported" and kinds["numpy"] == "manual"
+    assert a["summary"]["manifest"]["requirements"] == ["pandas", "numpy"]
+
+
+def test_reads_stdin_detection():
+    from app.analysis.assess import reads_stdin
+
+    assert reads_stdin("cpp", {"a.cpp": "int main(){int x; std::cin >> x;}"})
+    assert reads_stdin("python", {"a.py": "n = int(input())"})
+    assert not reads_stdin("cpp", {"a.cpp": "int main(){ std::cout << 1; }"})
+    assert not reads_stdin("python", {"a.py": "print(1 + 2)"})

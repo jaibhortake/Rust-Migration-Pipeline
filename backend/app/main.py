@@ -136,7 +136,7 @@ def _create(name: str, project: Project) -> dict:
     assessment, mappings = analyze(project)
     pid = uuid.uuid4().hex[:12]
     name = name.strip() or next(iter(project.files)).rsplit("/", 1)[-1]
-    db.insert_project(pid, name, project.language, project.files, assessment, mappings)
+    db.insert_project(pid, name, project.language, project.files, assessment, mappings, project.manifest)
     return {"id": pid}
 
 
@@ -225,26 +225,40 @@ async def save_mappings(pid: str, body: Mappings):
 @app.post("/api/projects/{pid}/reset-mappings", dependencies=[Depends(require_user)])
 async def reset_mappings(pid: str):
     p = await asyncio.to_thread(_project_or_404, pid)
-    _, mappings = analyze(Project(p["language"], p["files"]))
+    _, mappings = analyze(Project(p["language"], p["files"], p.get("manifest", {})))
     await asyncio.to_thread(db.update_mappings, pid, mappings)
     return mappings
 
 
 @app.post("/api/projects/{pid}/migrate", dependencies=[Depends(require_user)])
-async def migrate(pid: str):
+async def migrate(pid: str, resume: str | None = None):
+    """Start a migration. `resume=<job id>` continues from that job's checkpoint (recorded tests, finished modules)."""
     p = await asyncio.to_thread(_project_or_404, pid)
     if any(j.project_id == pid and not j.done for j in LIVE.values()):
         raise HTTPException(409, "a migration of this project is already running")
     if p["assessment"]["summary"]["blockers"]:
         raise HTTPException(422, "fix the blockers shown in the assessment first")
+    checkpoint = None
+    if resume:
+        prev = await asyncio.to_thread(db.get_job, resume)
+        if not prev or prev["project_id"] != pid:
+            raise HTTPException(404, "no such job to resume")
+        checkpoint = await asyncio.to_thread(db.get_checkpoint, resume)
+        if not checkpoint:
+            raise HTTPException(422, "that job has no checkpoint to resume from")
     jid = uuid.uuid4().hex[:12]
     job = LiveJob(jid, pid)
     LIVE[jid] = job
     await asyncio.to_thread(db.save_job, jid, pid, "running", [], None)
 
+    async def on_checkpoint(data: dict) -> None:
+        await asyncio.to_thread(db.save_checkpoint, jid, data)
+
     async def work() -> None:
         try:
-            result = await run_migration(Project(p["language"], p["files"]), p["mappings"], job.emit)
+            result = await run_migration(
+                Project(p["language"], p["files"], p.get("manifest", {})), p["mappings"], job.emit, checkpoint, on_checkpoint
+            )
             status = result["status"]
         except Exception as e:  # never leave a job "running"
             log.exception("job %s crashed", jid)
@@ -296,6 +310,19 @@ async def download(jid: str):
         z.writestr("migrated/MIGRATION_REPORT.md", report_markdown(p["name"] if p else jid, p or {}, res))
     return Response(
         buf.getvalue(), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="migrated-{jid}.zip"'}
+    )
+
+
+@app.get("/api/jobs/{jid}/report", dependencies=[Depends(require_user)])
+async def report_only(jid: str):
+    """Just the written report (Markdown), without the code."""
+    j = await asyncio.to_thread(db.get_job, jid)
+    if not j or not j["result"]:
+        raise HTTPException(404, "no report for this job")
+    p = await asyncio.to_thread(db.get_project, j["project_id"])
+    md = report_markdown(p["name"] if p else jid, p or {}, j["result"])
+    return Response(
+        md, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="report-{jid}.md"'}
     )
 
 

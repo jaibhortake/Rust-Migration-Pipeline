@@ -20,7 +20,18 @@ This project is built around those problems.
 | **4. Module-by-module translation** | Leaves first. Each module gets the contract plus the public API of modules already migrated. Each dependency group must pass `cargo check` (with compiler-guided repair) before the next group starts. | yes |
 | **5. Differential verification** | The whole crate is built and run on every recorded input. Failing inputs are **shrunk with delta debugging** before the repair prompt. | yes (repairs) |
 | **6. Quality** | clippy and rustfmt. A clippy clean-up is kept **only if every test still passes**. Scores count `unsafe`, unwrap/clone density and Rc/RefCell use. | yes (once) |
+| **6b. Function-level checks** | After the program-level check passes, an LLM writes a harness in the original language that calls individual functions and methods from stdin "call lines". The same harness is translated to Rust (built in a throwaway copy of the crate) and both are run on generated and mutated call sequences, with coverage. Catches bugs a whole-program run never reaches, and works for libraries with no `main`. | yes |
 | **7. Report** | Status, confidence, line and branch coverage, minimised failures, side-by-side diff. The download includes `MIGRATION_REPORT.md` and the recorded tests as a **`cargo test` regression suite**. | no |
+
+### Also built in
+- **Programs that read no input** are detected: test generation is skipped, the single deterministic run is compared once, and the UI says so.
+- **Qwen for cheap steps**: seed test-input generation goes to a local Ollama model when available (about 15 tokens/s on a 4 GB laptop GPU), and falls back to Groq if it is missing or slow. Set `CHEAP_LLM=groq` to turn it off.
+- **Truncated model replies are continued** automatically (large modules exceed the output limit).
+- **Parallel translation**: independent modules translate at the same time; each dependency wave must compile before the next.
+- **Resume**: a failed or interrupted migration keeps a checkpoint (recorded tests, compiled modules); "Resume from checkpoint" continues from there.
+- **requirements.txt / CMakeLists.txt** are read: declared Python packages are mapped (and unsupported ones flagged) up front; CMake selects the executable target, sources, include dirs and C++ standard.
+- **Old-toolchain tolerance**: C++ that relies on headers newer standard libraries include implicitly (for example `<utility>`) is retried with common headers force-included.
+- **Report extras**: plain-language explanation of every outcome, a check of which class/library decisions the translator actually followed, and a report-only download (`/api/jobs/<id>/report`).
 
 ### What "equivalent" means (and does not mean)
 The status is **"behaviourally equivalent on N tests"**: the Rust program printed exactly what the original printed
@@ -84,9 +95,15 @@ uv run python -m scripts.benchmark   # full pipeline vs one-shot LLM baseline on
 The integration tests drive the real sandbox with a scripted fake LLM: a deliberately wrong translation must be
 caught, minimised and repaired. CI (`.github/workflows/ci.yml`) runs lint, all tests and the frontend build.
 
-The benchmark covers 20 single-file programs and 3 multi-file projects. It scores the pipeline and a one-shot
-"just ask the LLM" baseline on **the same recorded inputs**, and reports pass rate, coverage, quality score and LLM calls.
-Results appear on the Benchmark page.
+The benchmark covers 30 programs (single files and multi-file projects, including a C++20 stress test). It scores the full
+pipeline and a one-shot "just ask the LLM" baseline on **the same recorded inputs**, and can switch one feature off at a time:
+
+```powershell
+uv run python -m scripts.benchmark --configs full,baseline,no-contract,no-targeting,no-minimize,no-repair,no-unit
+```
+
+Results (pass rate, coverage, quality, LLM calls, per-feature contribution) appear on the Benchmark page. A full run with all
+configurations is hours of LLM time on a free Groq tier; start with `--limit 5`.
 
 ## Layout
 
