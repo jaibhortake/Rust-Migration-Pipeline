@@ -90,6 +90,9 @@ CPP = {
     "random": _m(
         "seeded PRNG written by hand", "unsupported", confidence="low", note="No rand crate offline; outputs are not reproducible anyway."
     ),
+    "concepts": _m("trait bounds (T: Trait) and where-clauses", confidence="medium", note="A C++20 concept becomes a trait."),
+    "ranges": _m("iterator adapters (map, filter, take, collect)", confidence="medium"),
+    "type_traits": _m("generics with trait bounds; std::is_same_v checks become trait impls or match", confidence="medium"),
     "bits/stdc++.h": _m("std (imports chosen per use)", confidence="medium"),
 }
 

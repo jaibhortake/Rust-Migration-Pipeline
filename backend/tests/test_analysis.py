@@ -139,3 +139,17 @@ def test_library_mapping_kinds():
     kinds = {x["source"]: x["kind"] for x in m["libraries"]}
     assert kinds["re"] == "crate" and kinds["random"] == "unsupported" and kinds["heapq"] == "std"
     assert kinds["numpy"] == "manual"
+
+
+def test_program_output_pasted_as_source_is_blocked_not_wrapped():
+    """Regression: output text uploaded as main.cpp used to be 'wrapped' by the LLM into an empty main()."""
+    out = "===== STRESS TEST =====\n\n[1] Statistics\nSum: 150\nAverage: 30\n"
+    a, _ = analyze(build_project({"main.cpp": out}))
+    s = a["summary"]
+    assert s["readiness"] == "blocked" and not s["single_function"]
+    assert any("does not look like C++ source" in b for b in s["blockers"])
+
+
+def test_file_without_any_code_is_blocked():
+    a, _ = analyze(build_project({"x.py": "# just a comment\nX = 1\n"}))
+    assert a["summary"]["readiness"] == "blocked" and not a["summary"]["single_function"]

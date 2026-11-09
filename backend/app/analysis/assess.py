@@ -1,5 +1,7 @@
 """Pre-migration assessment: runs without an LLM, so it is instant and free."""
 
+import re
+
 from app.analysis.graph import build_graph
 from app.analysis.project import Project
 from app.analysis.risks import SEVERITY_WEIGHT, find_risks
@@ -9,6 +11,13 @@ from app.mapping.libraries import map_libraries
 from app.mapping.types import map_types
 
 MANUAL_LOC_PER_HOUR = 30  # rough industry figure for careful manual porting incl. tests
+
+
+def looks_like_source(language: str, code: str) -> bool:
+    """Cheap sanity check that a file with syntax errors was at least meant to be code."""
+    if language == "cpp":
+        return ";" in code and "{" in code
+    return bool(re.search(r"^\s*(def|class|import|from|for|while|if|print)\b|\w\s*=\s*\S", code, re.M))
 
 
 def analyze(project: Project) -> tuple[dict, dict]:
@@ -69,6 +78,14 @@ def analyze(project: Project) -> tuple[dict, dict]:
     blockers = []
     if syntax:
         blockers.append("Syntax errors: " + ", ".join(f"{p} line {ls[0]}" for p, ls in syntax.items()))
+        text_like = [p for p in syntax if not looks_like_source(project.language, project.files[p])]
+        if text_like:
+            blockers.append(
+                f"{', '.join(text_like)} does not look like {'C++' if project.language == 'cpp' else 'Python'} source code. "
+                "It may be a program's output or plain text: upload the source file instead."
+            )
+    elif not any(s.functions or s.classes for s in symbols.values()):
+        blockers.append("No functions or classes found: there is no code to migrate.")
     entries = [u for u in graph.units.values() if u.is_entry]
     if len(entries) > 1:
         blockers.append("More than one entry point: " + ", ".join(u.id for u in entries))
@@ -104,7 +121,7 @@ def analyze(project: Project) -> tuple[dict, dict]:
             "verdict": verdict,
             "blockers": blockers,
             "unsupported": unsupported,
-            "single_function": len(project.files) == 1 and not entries,
+            "single_function": len(project.files) == 1 and not entries and not blockers,
         },
         "graph": graph.to_dict(),
         "units": units,

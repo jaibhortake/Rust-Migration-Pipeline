@@ -198,6 +198,22 @@ CPP_RULES = [
         "Type punning has no safe equivalent.",
         "Use explicit conversions (from_le_bytes, as for numerics) or redesign.",
     ),
+    (
+        "variant-visit",
+        "medium",
+        r"\bstd::visit\b|\bvisit\s*\(|\bvariant\s*<",
+        "std::variant / visit",
+        "A variant is a tagged union; visitors with `if constexpr` branch on the type at compile time.",
+        "Use a Rust enum with one variant per alternative and a match; recursive alternatives need Box.",
+    ),
+    (
+        "concepts",
+        "medium",
+        r"\bconcept\s+\w+|\brequires\b",
+        "C++20 concepts",
+        "Constraints on templates have no direct syntax in Rust.",
+        "Define a trait (with the required operations) and use it as a bound: T: Numeric.",
+    ),
     ("union", "high", r"\bunion\s+\w*\s*\{", "Unions", "Untagged unions require unsafe.", "Use a Rust enum (tagged union)."),
     ("goto", "high", r"\bgoto\s+\w+", "goto", "Rust has no goto.", "Restructure with loops and labeled break/continue."),
     (

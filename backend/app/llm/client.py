@@ -76,18 +76,45 @@ async def _groq(messages: list[dict], temperature: float, usage: Usage) -> str:
     raise LLMError("groq: retries exhausted")
 
 
+_ollama_model: str | None = None
+
+
+async def ollama_model() -> str:
+    """The configured model if installed, otherwise the first installed chat model (embedding models skipped)."""
+    global _ollama_model
+    if _ollama_model:
+        return _ollama_model
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{settings.ollama_base_url}/api/tags")
+    names = [m["name"] for m in r.json().get("models", []) if "embed" not in m["name"]] if r.status_code == 200 else []
+    want = settings.ollama_chat_model
+    pick = next((n for n in names if n == want or n.split(":")[0] == want.split(":")[0]), names[0] if names else want)
+    if pick != want:
+        log.warning("ollama model %s not installed, using %s", want, pick)
+    _ollama_model = pick
+    return pick
+
+
 async def _ollama(messages: list[dict], temperature: float, usage: Usage) -> str:
-    async with httpx.AsyncClient(timeout=300) as client:
+    model = await ollama_model()
+    async with httpx.AsyncClient(timeout=600) as client:
         r = await client.post(
             f"{settings.ollama_base_url}/api/chat",
-            json={"model": settings.ollama_chat_model, "messages": messages, "stream": False, "options": {"temperature": temperature}},
+            # think=False: reasoning models (qwen3, deepseek-r1) otherwise spend minutes on hidden reasoning
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": temperature, "num_ctx": 16384},
+            },
         )
     if r.status_code != 200:
         raise LLMError(f"ollama {r.status_code}: {r.text[:300]}")
     data = r.json()
     usage.prompt_tokens += data.get("prompt_eval_count", 0)
     usage.completion_tokens += data.get("eval_count", 0)
-    return data["message"]["content"]
+    return re.sub(r"<think>.*?</think>\s*", "", data["message"]["content"], flags=re.S)
 
 
 def _key(messages: list[dict], temperature: float, variant: int) -> str:

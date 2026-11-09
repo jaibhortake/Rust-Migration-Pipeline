@@ -154,18 +154,22 @@ class Migration:
         await self.emit("prepare", "running", {})
         self.assessment, suggested = analyze(self.project)
         s = self.assessment["summary"]
-        if s["blockers"] and not s["single_function"]:
+        if s["blockers"]:
             await self.emit("prepare", "failed", {"errors": s["blockers"]})
             self.result["message"] = "; ".join(s["blockers"])
             return False
         if s["single_function"]:
             path, code = next(iter(self.project.files.items()))
+            original_names = {f["name"] for f in self.assessment["symbols"][path]["functions"]} | {
+                c["name"] for c in self.assessment["symbols"][path]["classes"]
+            }
             for attempt in range(3):
                 text = await self.ask(prompts.DRIVER_SYSTEM, f"Language: {self.project.language}\n\n{code}", variant=attempt)
                 program = extract_block(text, r"python|py|cpp|c\+\+")
                 trial = Project(self.project.language, {path: program})
                 a, _ = analyze(trial)
-                if not a["summary"]["blockers"] and not a["summary"]["single_function"]:
+                kept = {f["name"] for f in a["symbols"][path]["functions"]} | {c["name"] for c in a["symbols"][path]["classes"]}
+                if not a["summary"]["blockers"] and not a["summary"]["single_function"] and original_names <= kept:
                     self.project, self.assessment = trial, a
                     break
             else:
@@ -195,7 +199,7 @@ class Migration:
             for s in sources:
                 obj = "obj/" + s.replace("/", "__").rsplit(".", 1)[0] + ".o"
                 r = await self.sb.run(
-                    ["g++", "-std=c++17", "-O0", "--coverage", "-I", ".", "-c", s, "-o", obj], "orig", timeout=settings.build_timeout_s
+                    ["g++", "-std=c++20", "-O0", "--coverage", "-I", ".", "-c", s, "-o", obj], "orig", timeout=settings.build_timeout_s
                 )
                 if not r.ok:
                     return await self._orig_fail(r)
@@ -204,7 +208,7 @@ class Migration:
             if not r.ok:
                 return await self._orig_fail(r)
             r = await self.sb.run(
-                ["g++", "-std=c++17", "-O2", "-I", ".", *sources, "-o", "plain_bin"], "orig", timeout=settings.build_timeout_s
+                ["g++", "-std=c++20", "-O2", "-I", ".", *sources, "-o", "plain_bin"], "orig", timeout=settings.build_timeout_s
             )
             if not r.ok:
                 return await self._orig_fail(r)
@@ -332,6 +336,12 @@ class Migration:
         if not self.cases:
             await self.emit("tests", "failed", {"errors": "outputs are not deterministic"})
             self.result["message"] = "the original program's output is not deterministic"
+            return False
+        if not any(norm(c["expected"]) for c in self.cases):
+            await self.emit("tests", "failed", {"errors": "the original program prints nothing on any input"})
+            self.result["message"] = (
+                "the original program prints nothing on every input, so there is nothing to compare: equivalence cannot be checked"
+            )
             return False
         await self.emit(
             "tests",

@@ -235,7 +235,7 @@ async def migrate(pid: str):
     p = await asyncio.to_thread(_project_or_404, pid)
     if any(j.project_id == pid and not j.done for j in LIVE.values()):
         raise HTTPException(409, "a migration of this project is already running")
-    if p["assessment"]["summary"]["blockers"] and not p["assessment"]["summary"]["single_function"]:
+    if p["assessment"]["summary"]["blockers"]:
         raise HTTPException(422, "fix the blockers shown in the assessment first")
     jid = uuid.uuid4().hex[:12]
     job = LiveJob(jid, pid)
